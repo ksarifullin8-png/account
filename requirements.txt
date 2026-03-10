@@ -1,5 +1,11 @@
+# Основные зависимости
 aiogram==3.17.0
-telethon==1.36.0
-requests==2.31.0
-python-dateutil==2.9.0
+telethon==1.38.0
+requests==2.32.3
+python-dotenv==1.0.1  # Для работы с .env файлами (нужно для Docker)
+
+# Дополнительно
+python-dateutil==2.9.0.post0
 colorama==0.4.6
+cryptg==0.4.0  # Для ускорения работы Telethon
+pymongo==4.8.0  # Если используешь MongoDB (хотя у тебя sqlite)
