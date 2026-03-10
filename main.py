@@ -555,13 +555,13 @@ async def verify_code(phone, code):
             return {'success': False, 'error': '❌ Сессия истекла'}
         
         await client.sign_in(code=code)
+        
+        # Если дошли сюда - код верный и 2FA не нужен
         me = await client.get_me()
         session_string = client.session.save()
         region = await detect_region(phone)
         year = getattr(me, 'date', None)
         year = year.year if year and hasattr(year, 'year') else datetime.now().year
-        
-        active_sessions[phone] = session_string
         
         return {
             'success': True,
@@ -571,8 +571,16 @@ async def verify_code(phone, code):
             'phone': phone,
             'client': client
         }
+        
     except SessionPasswordNeededError:
-        return {'success': True, 'need_password': True, 'phone': phone}
+        # ВОТ ЭТО ВАЖНО! Возвращаем need_password=True
+        return {
+            'success': True, 
+            'need_password': True, 
+            'phone': phone
+        }
+    except PhoneCodeInvalidError:
+        return {'success': False, 'error': '❌ Неверный код'}
     except Exception as e:
         return {'success': False, 'error': str(e)}
 
@@ -1572,6 +1580,7 @@ async def product_name_handler(message: types.Message, state: FSMContext):
     await message.answer("💰 ВВЕДИ ЦЕНУ В РУБЛЯХ:")
     await state.set_state(ProductStates.waiting_for_price)
 
+
 @dp.message(ProductStates.waiting_for_price)
 async def product_price_handler(message: types.Message, state: FSMContext):
     try:
@@ -1582,20 +1591,40 @@ async def product_price_handler(message: types.Message, state: FSMContext):
     except ValueError:
         await message.answer("❌ ВВЕДИ ЧИСЛО.")
 
+
 @dp.message(ProductStates.waiting_for_phone)
 async def product_phone_handler(message: types.Message, state: FSMContext):
     phone = message.text.strip()
     await state.update_data(phone=phone)
     
-    # Спрашиваем про пароль
-    await message.answer("🔐 ВВЕДИ ПАРОЛЬ ОТ АККАУНТА (ЕСЛИ ЕСТЬ, ИЛИ ОТПРАВЬ ПРОПУСТИТЬ):")
+    # ШАГ 1: Спрашиваем пароль от аккаунта
+    await message.answer(
+        "🔐 ВВЕДИ ПАРОЛЬ ОТ АККАУНТА\n\n"
+        "Если пароля нет - отправь: пропустить"
+    )
     await state.set_state(ProductStates.waiting_for_account_password)
+
+
+@dp.message(ProductStates.waiting_for_account_password)
+async def product_account_password_handler(message: types.Message, state: FSMContext):
+    password = message.text.strip()
     
-    status_msg = await message.answer("🔄 ВЫПОЛНЯЮ ВХОД В АККАУНТ...")
+    # ШАГ 2: Сохраняем пароль аккаунта
+    if password.lower() in ['пропустить', 'нет', '-', '']:
+        await state.update_data(account_password=None)
+    else:
+        await state.update_data(account_password=password)
+    
+    # ШАГ 3: Начинаем вход в Telegram
+    data = await state.get_data()
+    phone = data.get('phone')
+    
+    status_msg = await message.answer("🔄 ВЫПОЛНЯЮ ВХОД В TELEGRAM...")
     result = await login_to_telegram(phone)
     
     if result['success']:
         if result.get('already_logged'):
+            # Случай А: Уже авторизован - сразу добавляем
             data = await state.get_data()
             product_id = add_product(
                 data['name'],
@@ -1603,7 +1632,8 @@ async def product_phone_handler(message: types.Message, state: FSMContext):
                 result['phone'],
                 result['session'],
                 result['region'],
-                result['year']
+                result['year'],
+                data.get('account_password')
             )
             await status_msg.edit_text(
                 f"✅ АККАУНТ УСПЕШНО ДОБАВЛЕН!\n\n"
@@ -1611,20 +1641,25 @@ async def product_phone_handler(message: types.Message, state: FSMContext):
                 f"💰 ЦЕНА: {data['price']} ₽\n"
                 f"🌍 РЕГИОН: {result['region']}\n"
                 f"📅 ГОД СОЗДАНИЯ: {result['year']}\n"
+                f"🔑 ПАРОЛЬ: {data.get('account_password', 'НЕТ')}\n"
                 f"🆔 ID ТОВАРА: {product_id}"
             )
             await state.clear()
+            
         elif result.get('need_code'):
+            # Случай Б: Нужен код подтверждения
             await state.update_data(phone=result['phone'])
             await status_msg.edit_text(
                 f"📱 КОД ПОДТВЕРЖДЕНИЯ ОТПРАВЛЕН НА НОМЕР {result['phone']}\n\n"
                 f"ВВЕДИ КОД ИЗ TELEGRAM:"
             )
             await state.set_state(ProductStates.waiting_for_code)
+            
         else:
-            await status_msg.edit_text(f"❌ ОШИБКА: {result.get('error', 'НЕИЗВЕСТНАЯ ОШИБКА')}")
+            await status_msg.edit_text(f"❌ ОШИБКА: {result.get('error', 'НЕИЗВЕСТНАЯ')}")
     else:
-        await status_msg.edit_text(f"❌ ОШИБКА ВХОДА: {result.get('error', 'НЕИЗВЕСТНАЯ ОШИБКА')}")
+        await status_msg.edit_text(f"❌ ОШИБКА ВХОДА: {result.get('error', 'НЕИЗВЕСТНАЯ')}")
+
 
 @dp.message(ProductStates.waiting_for_code)
 async def product_code_handler(message: types.Message, state: FSMContext):
@@ -1637,13 +1672,16 @@ async def product_code_handler(message: types.Message, state: FSMContext):
     
     if result['success']:
         if result.get('need_password'):
-            await state.update_data(phone=result['phone'])
+            # Случай В: Нужен 2FA пароль
+            await state.update_data(phone=phone)
             await status_msg.edit_text(
-                "🔐 ТРЕБУЕТСЯ ПАРОЛЬ ДВУХФАКТОРНОЙ АУТЕНТИФИКАЦИИ\n\n"
-                "ВВЕДИ ПАРОЛЬ:"
+                "🔐 ТРЕБУЕТСЯ 2FA ПАРОЛЬ\n\n"
+                "ВВЕДИ ПАРОЛЬ ДВУХФАКТОРНОЙ АУТЕНТИФИКАЦИИ:"
             )
             await state.set_state(ProductStates.waiting_for_password)
+            
         else:
+            # Случай Г: Успешный вход без 2FA
             data = await state.get_data()
             product_id = add_product(
                 data['name'],
@@ -1651,7 +1689,8 @@ async def product_code_handler(message: types.Message, state: FSMContext):
                 result['phone'],
                 result['session'],
                 result['region'],
-                result['year']
+                result['year'],
+                data.get('account_password')
             )
             await status_msg.edit_text(
                 f"✅ АККАУНТ УСПЕШНО ДОБАВЛЕН!\n\n"
@@ -1659,34 +1698,34 @@ async def product_code_handler(message: types.Message, state: FSMContext):
                 f"💰 ЦЕНА: {data['price']} ₽\n"
                 f"🌍 РЕГИОН: {result['region']}\n"
                 f"📅 ГОД СОЗДАНИЯ: {result['year']}\n"
+                f"🔑 ПАРОЛЬ: {data.get('account_password', 'НЕТ')}\n"
                 f"🆔 ID ТОВАРА: {product_id}"
             )
             await state.clear()
     else:
-        await status_msg.edit_text(f"❌ ОШИБКА: {result.get('error', 'НЕИЗВЕСТНАЯ ОШИБКА')}")
+        await status_msg.edit_text(f"❌ ОШИБКА: {result.get('error', 'НЕИЗВЕСТНАЯ')}")
 
-@dp.message(ProductStates.waiting_for_account_password)
-async def product_account_password_handler(message: types.Message, state: FSMContext):
+
+@dp.message(ProductStates.waiting_for_password)
+async def product_password_handler(message: types.Message, state: FSMContext):
     password = message.text.strip()
-    if password.lower() in ['пропустить', 'нет', '-', '']:
-        await state.update_data(account_password=None)
-    else:
-        await state.update_data(account_password=password)
-    
     data = await state.get_data()
     phone = data.get('phone')
     
-    status_msg = await message.answer("🔄 ВЫПОЛНЯЮ ВХОД В АККАУНТ...")
-    result = await login_to_telegram(phone)
+    status_msg = await message.answer("🔄 ПРОВЕРЯЮ 2FA ПАРОЛЬ...")
+    result = await verify_password(phone, password)
     
     if result['success']:
+        # Случай Д: Успешный вход с 2FA
+        data = await state.get_data()
         product_id = add_product(
             data['name'],
             data['price'],
             result['phone'],
             result['session'],
             result['region'],
-            result['year']
+            result['year'],
+            data.get('account_password')
         )
         await status_msg.edit_text(
             f"✅ АККАУНТ УСПЕШНО ДОБАВЛЕН!\n\n"
@@ -1694,75 +1733,12 @@ async def product_account_password_handler(message: types.Message, state: FSMCon
             f"💰 ЦЕНА: {data['price']} ₽\n"
             f"🌍 РЕГИОН: {result['region']}\n"
             f"📅 ГОД СОЗДАНИЯ: {result['year']}\n"
+            f"🔑 ПАРОЛЬ: {data.get('account_password', 'НЕТ')}\n"
             f"🆔 ID ТОВАРА: {product_id}"
         )
         await state.clear()
     else:
         await status_msg.edit_text(f"❌ ОШИБКА: {result.get('error', 'НЕВЕРНЫЙ ПАРОЛЬ')}")
-
-@dp.callback_query(F.data == "admin_delete_product")
-async def admin_delete_product(callback: types.CallbackQuery):
-    products = get_products()
-    
-    if not products:
-        await callback.message.edit_text("📭 НЕТ ТОВАРОВ.")
-        await callback.answer()
-        return
-    
-    buttons = []
-    for product in products:
-        if len(product) >= 8:
-            product_id, name, price, phone, session, region, year, added = product[:8]
-            buttons.append([InlineKeyboardButton(
-                text=f"{name} | {region} | {price} ₽",
-                callback_data=f"del_{product_id}"
-            )])
-    
-    buttons.append([InlineKeyboardButton(text="🔙 НАЗАД", callback_data="admin_back")])
-    
-    await callback.message.edit_text(
-        "🗑 ВЫБЕРИ ТОВАР ДЛЯ УДАЛЕНИЯ:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
-    )
-    await callback.answer()
-
-@dp.callback_query(lambda c: c.data.startswith('del_'))
-async def confirm_delete(callback: types.CallbackQuery):
-    product_id = int(callback.data.split('_')[1])
-    delete_product(product_id)
-    await callback.message.edit_text("✅ ТОВАР УДАЛЕН!")
-    await callback.answer()
-
-@dp.callback_query(F.data == "admin_list_products")
-async def admin_list_products(callback: types.CallbackQuery):
-    products = get_products()
-    
-    if not products:
-        await callback.message.edit_text("📭 НЕТ ТОВАРОВ.")
-        await callback.answer()
-        return
-    
-    text = "📦 СПИСОК ТОВАРОВ:\n\n"
-    for product in products:
-        if len(product) >= 8:
-            product_id, name, price, phone, session, region, year, added = product[:8]
-            text += (
-                f"🆔 ID: {product_id}\n"
-                f"📦 НАЗВАНИЕ: {name}\n"
-                f"💰 ЦЕНА: {price} ₽\n"
-                f"📱 ТЕЛЕФОН: {phone}\n"
-                f"🌍 РЕГИОН: {region}\n"
-                f"📅 ГОД: {year}\n"
-                f"{'─' * 30}\n"
-            )
-    
-    if len(text) > 4000:
-        for i in range(0, len(text), 4000):
-            await callback.message.answer(text[i:i+4000])
-    else:
-        await callback.message.edit_text(text)
-    
-    await callback.answer()
 
 @dp.callback_query(F.data == "admin_stats")
 async def admin_stats(callback: types.CallbackQuery):
