@@ -1627,3 +1627,516 @@ async def sbp_amount_handler(message: types.Message, state: FSMContext):
     except ValueError:
         await message.answer("❌ ВВЕДИ ЧИСЛО")
 
+@dp.callback_query(F.data == "pay_crypto")
+async def pay_crypto(callback: types.CallbackQuery, state: FSMContext):
+    log_user_action(callback.from_user.id, "pay_crypto")
+    
+    await safe_edit_message(
+        callback.message,
+        "₿ <b>ПОПОЛНЕНИЕ ЧЕРЕЗ CRYPTOBOT</b>\n\n"
+        "ВВЕДИ СУММУ В РУБЛЯХ:"
+    )
+    await state.set_state(PaymentStates.waiting_for_crypto_amount)
+    await callback.answer()
+
+@dp.message(PaymentStates.waiting_for_crypto_amount)
+async def crypto_amount_handler(message: types.Message, state: FSMContext):
+    try:
+        amount = float(message.text)
+        final = amount
+        
+        if can_use_discount(message.from_user.id):
+            discount = get_setting('referral_discount')
+            final = amount * (1 - discount / 100)
+            apply_first_discount(message.from_user.id)
+        
+        invoice = await create_crypto_invoice(final)
+        if not invoice:
+            await message.answer("❌ ОШИБКА ПРИ СОЗДАНИИ СЧЕТА. ПОПРОБУЙ ПОЗЖЕ.")
+            await state.clear()
+            return
+        
+        payment_id = add_pending_payment(message.from_user.id, final, "crypto", invoice['invoice_id'])
+        
+        text = (
+            f"₿ <b>СЧЕТ СОЗДАН</b>\n\n"
+            f"💰 СУММА: <code>{final} ₽</code>\n"
+            f"💲 USDT: <code>{invoice['amount']}</code>"
+        )
+        
+        await message.answer(
+            text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💳 ОПЛАТИТЬ", url=invoice['pay_url'])]
+            ])
+        )
+        await state.clear()
+    except ValueError:
+        await message.answer("❌ ВВЕДИ ЧИСЛО")
+
+# ==================== АДМИНСКИЕ ОБРАБОТЧИКИ ПЛАТЕЖЕЙ ====================
+@dp.callback_query(lambda c: c.data.startswith('send_details_'))
+async def send_payment_details(callback: types.CallbackQuery, state: FSMContext):
+    payment_id = int(callback.data.split('_')[2])
+    await state.update_data(payment_id=payment_id)
+    await safe_edit_message(callback.message, "✍️ ВВЕДИ РЕКВИЗИТЫ ДЛЯ ОПЛАТЫ:")
+    await state.set_state(AdminPaymentStates.waiting_for_payment_details)
+    await callback.answer()
+
+@dp.message(AdminPaymentStates.waiting_for_payment_details)
+async def payment_details_handler(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    payment_id = data.get('payment_id')
+    payment = get_pending_payment(payment_id)
+    
+    if payment:
+        try:
+            await bot.send_message(
+                payment[1],
+                f"💳 <b>РЕКВИЗИТЫ ДЛЯ ОПЛАТЫ</b>\n\n"
+                f"💰 СУММА: <code>{payment[2]} ₽</code>\n"
+                f"📱 СПОСОБ: {payment[3].upper()}\n\n"
+                f"РЕКВИЗИТЫ:\n<code>{message.text}</code>\n\n"
+                f"ПОСЛЕ ОПЛАТЫ НАЖМИ КНОПКУ НИЖЕ:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="✅ Я ПЕРЕВЕЛ", callback_data=f"user_paid_{payment_id}")]
+                ])
+            )
+            await message.answer("✅ РЕКВИЗИТЫ ОТПРАВЛЕНЫ ПОЛЬЗОВАТЕЛЮ.")
+        except Exception as e:
+            await message.answer(f"❌ ОШИБКА ОТПРАВКИ: {e}")
+    
+    await state.clear()
+
+@dp.callback_query(lambda c: c.data.startswith('user_paid_'))
+async def user_paid(callback: types.CallbackQuery):
+    payment_id = int(callback.data.split('_')[2])
+    payment = get_pending_payment(payment_id)
+    
+    if payment:
+        for admin_id in ADMIN_IDS:
+            await bot.send_message(
+                admin_id,
+                f"💰 <b>ПОЛЬЗОВАТЕЛЬ СООБЩИЛ ОБ ОПЛАТЕ</b>\n\n"
+                f"🆔 ПЛАТЕЖ ID: {payment_id}\n"
+                f"👤 ПОЛЬЗОВАТЕЛЬ ID: {payment[1]}\n"
+                f"💵 СУММА: {payment[2]} ₽\n"
+                f"📱 МЕТОД: {payment[3]}",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="✅ ПОДТВЕРДИТЬ", callback_data=f"admin_confirm_{payment_id}"),
+                     InlineKeyboardButton(text="❌ ОТКЛОНИТЬ", callback_data=f"admin_reject_{payment_id}")]
+                ])
+            )
+        await safe_edit_message(callback.message, "✅ СООБЩЕНИЕ ОТПРАВЛЕНО АДМИНИСТРАТОРУ.")
+    
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith('admin_confirm_'))
+async def admin_confirm_payment(callback: types.CallbackQuery):
+    payment_id = int(callback.data.split('_')[2])
+    payment = get_pending_payment(payment_id)
+    
+    if payment:
+        update_balance(payment[1], payment[2])
+        update_payment_status(payment_id, 'confirmed')
+        
+        user = get_user(payment[1])
+        if user and user[4]:
+            reward = payment[2] * (get_setting('referral_reward') / 100)
+            update_balance(user[4], reward)
+        
+        try:
+            await bot.send_message(
+                payment[1],
+                f"✅ <b>ПЛАТЕЖ ПОДТВЕРЖДЕН!</b>\n\n"
+                f"💰 СУММА: <code>{payment[2]} ₽</code>\n"
+                f"💳 БАЛАНС ПОПОЛНЕН."
+            )
+        except:
+            pass
+        
+        await safe_edit_message(callback.message, f"✅ ПЛАТЕЖ #{payment_id} ПОДТВЕРЖДЕН.")
+    
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith('admin_reject_'))
+async def admin_reject_payment(callback: types.CallbackQuery):
+    payment_id = int(callback.data.split('_')[2])
+    payment = get_pending_payment(payment_id)
+    
+    if payment:
+        update_payment_status(payment_id, 'rejected')
+        
+        try:
+            await bot.send_message(
+                payment[1],
+                f"❌ <b>ПЛАТЕЖ ОТКЛОНЕН.</b>\n\n"
+                f"💰 СУММА: <code>{payment[2]} ₽</code>\n"
+                f"📞 СВЯЖИСЬ С ПОДДЕРЖКОЙ."
+            )
+        except:
+            pass
+        
+        await safe_edit_message(callback.message, f"❌ ПЛАТЕЖ #{payment_id} ОТКЛОНЕН.")
+    
+    await callback.answer()
+
+# ==================== АДМИН ПАНЕЛЬ ====================
+@dp.message(F.text == "⚙️ АДМИН")
+async def admin_panel(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("❌ У ТЕБЯ НЕТ ДОСТУПА.")
+        return
+    await message.answer("⚙️ <b>АДМИН ПАНЕЛЬ</b>", reply_markup=admin_keyboard())
+
+# ----- ДОБАВЛЕНИЕ ТОВАРА -----
+@dp.callback_query(F.data == "admin_add_product")
+async def admin_add_product(callback: types.CallbackQuery, state: FSMContext):
+    await safe_edit_message(callback.message, "➕ ВВЕДИ НАЗВАНИЕ ТОВАРА:")
+    await state.set_state(ProductStates.waiting_for_name)
+    await callback.answer()
+
+@dp.message(ProductStates.waiting_for_name)
+async def product_name_handler(message: types.Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await message.answer("💰 ВВЕДИ ЦЕНУ В РУБЛЯХ:")
+    await state.set_state(ProductStates.waiting_for_price)
+
+@dp.message(ProductStates.waiting_for_price)
+async def product_price_handler(message: types.Message, state: FSMContext):
+    try:
+        price = float(message.text)
+        await state.update_data(price=price)
+        await message.answer("📱 ВВЕДИ НОМЕР ТЕЛЕФОНА АККАУНТА:")
+        await state.set_state(ProductStates.waiting_for_phone)
+    except ValueError:
+        await message.answer("❌ ВВЕДИ ЧИСЛО.")
+
+@dp.message(ProductStates.waiting_for_phone)
+async def product_phone_handler(message: types.Message, state: FSMContext):
+    phone = message.text.strip()
+    await state.update_data(phone=phone)
+    
+    await message.answer(
+        "🔐 <b>ВВЕДИ ПАРОЛЬ ОТ АККАУНТА (ОБЛАЧНЫЙ ПАРОЛЬ / 2FA)</b>\n\n"
+        "Если пароля нет - отправь: <code>пропустить</code>"
+    )
+    await state.set_state(ProductStates.waiting_for_account_password)
+
+@dp.message(ProductStates.waiting_for_account_password)
+async def product_account_password_handler(message: types.Message, state: FSMContext):
+    password = message.text.strip()
+    logger.info(f"🔐 Получен пароль аккаунта: {'[СКРЫТ]' if password != 'пропустить' else 'пропустить'}")
+    
+    if password.lower() in ['пропустить', 'нет', '-', '']:
+        await state.update_data(account_password=None)
+        logger.info("💾 Пароль не сохранен (пропущен)")
+    else:
+        await state.update_data(account_password=password)
+        logger.info("💾 Пароль сохранен")
+    
+    data = await state.get_data()
+    phone = data.get('phone')
+    
+    status_msg = await message.answer("🔄 ВЫПОЛНЯЮ ВХОД В TELEGRAM...")
+    
+    try:
+        logger.info(f"📱 Начинаем вход для номера: {phone}")
+        result = await login_to_telegram(phone)
+        logger.info(f"📊 Результат входа: {result}")
+        
+        if not result['success']:
+            error_text = result.get('error', 'НЕИЗВЕСТНАЯ ОШИБКА')
+            logger.error(f"❌ Ошибка входа: {error_text}")
+            await status_msg.edit_text(f"❌ ОШИБКА ВХОДА: {error_text}")
+            await state.clear()
+            return
+        
+        if result.get('already_logged'):
+            logger.info("✅ Аккаунт уже авторизован, добавляем товар")
+            data = await state.get_data()
+            pid = add_product(
+                data['name'],
+                data['price'],
+                result['phone'],
+                result['session'],
+                result['region'],
+                result['year'],
+                data.get('account_password')
+            )
+            logger.info(f"✅ Товар добавлен с ID: {pid}")
+            await status_msg.edit_text(
+                f"✅ <b>АККАУНТ УСПЕШНО ДОБАВЛЕН!</b>\n\n"
+                f"📦 НАЗВАНИЕ: <b>{data['name']}</b>\n"
+                f"💰 ЦЕНА: <code>{data['price']} ₽</code>\n"
+                f"🌍 РЕГИОН: {result['region']}\n"
+                f"📅 ГОД: {result['year']}\n"
+                f"🔑 ПАРОЛЬ: <code>{data.get('account_password', 'НЕТ')}</code>\n"
+                f"🆔 ID: <code>{pid}</code>"
+            )
+            await state.clear()
+            
+        elif result.get('need_code'):
+            logger.info(f"📱 Требуется код подтверждения для {result['phone']}")
+            await state.update_data(phone=result['phone'])
+            await status_msg.edit_text(
+                f"📱 <b>КОД ПОДТВЕРЖДЕНИЯ ОТПРАВЛЕН НА НОМЕР {result['phone']}</b>\n\n"
+                f"ВВЕДИ КОД ИЗ TELEGRAM:"
+            )
+            await state.set_state(ProductStates.waiting_for_code)
+        else:
+            logger.error(f"❌ Неизвестный сценарий: {result}")
+            await status_msg.edit_text(f"❌ НЕИЗВЕСТНЫЙ СЦЕНАРИЙ")
+            await state.clear()
+            
+    except Exception as e:
+        logger.error(f"❌ Критическая ошибка: {e}")
+        traceback.print_exc()
+        await status_msg.edit_text(f"❌ ОШИБКА: {str(e)[:100]}")
+        await state.clear()
+
+@dp.message(ProductStates.waiting_for_code)
+async def product_code_handler(message: types.Message, state: FSMContext):
+    code = message.text.strip()
+    logger.info(f"\n🔍 DEBUG: product_code_handler вызван")
+    
+    data = await state.get_data()
+    phone = data.get('phone')
+    logger.info(f"🔍 DEBUG: Телефон из state: {phone}")
+    
+    if phone in temp_clients:
+        logger.info(f"✅ Клиент найден в temp_clients")
+    else:
+        logger.error(f"❌ Клиент НЕ найден в temp_clients!")
+        logger.info(f"🔍 Доступные ключи: {list(temp_clients.keys())}")
+    
+    status_msg = await message.answer("🔄 ПРОВЕРЯЮ КОД...")
+    result = await verify_code(phone, code)
+    
+    if not result['success']:
+        await status_msg.edit_text(f"❌ ОШИБКА: {result.get('error', 'НЕИЗВЕСТНАЯ')}")
+        await state.clear()
+        return
+    
+    if result.get('need_password'):
+        logger.info("🔐 Требуется 2FA пароль")
+        await state.update_data(phone=phone)
+        await status_msg.edit_text(
+            "🔐 <b>ТРЕБУЕТСЯ 2FA ПАРОЛЬ (ОБЛАЧНЫЙ ПАРОЛЬ)</b>\n\n"
+            "ВВЕДИ ПАРОЛЬ:"
+        )
+        await state.set_state(ProductStates.waiting_for_password)
+    else:
+        logger.info("✅ Успешный вход без 2FA")
+        data = await state.get_data()
+        pid = add_product(
+            data['name'],
+            data['price'],
+            result['phone'],
+            result['session'],
+            result['region'],
+            result['year'],
+            data.get('account_password')
+        )
+        logger.info(f"✅ Товар добавлен с ID: {pid}")
+        await status_msg.edit_text(
+            f"✅ <b>АККАУНТ УСПЕШНО ДОБАВЛЕН!</b>\n\n"
+            f"📦 НАЗВАНИЕ: <b>{data['name']}</b>\n"
+            f"💰 ЦЕНА: <code>{data['price']} ₽</code>\n"
+            f"🌍 РЕГИОН: {result['region']}\n"
+            f"📅 ГОД: {result['year']}\n"
+            f"🔑 ПАРОЛЬ: <code>{data.get('account_password', 'НЕТ')}</code>\n"
+            f"🆔 ID: <code>{pid}</code>"
+        )
+        await state.clear()
+
+@dp.message(ProductStates.waiting_for_password)
+async def product_password_handler(message: types.Message, state: FSMContext):
+    password = message.text.strip()
+    data = await state.get_data()
+    phone = data['phone']
+    
+    status_msg = await message.answer("🔄 ПРОВЕРЯЮ 2FA ПАРОЛЬ...")
+    result = await verify_password(phone, password)
+    
+    if not result['success']:
+        await status_msg.edit_text(f"❌ ОШИБКА: {result.get('error', 'НЕВЕРНЫЙ ПАРОЛЬ')}")
+        return
+    
+    data = await state.get_data()
+    pid = add_product(
+        data['name'],
+        data['price'],
+        result['phone'],
+        result['session'],
+        result['region'],
+        result['year'],
+        data.get('account_password')
+    )
+    await status_msg.edit_text(
+        f"✅ <b>АККАУНТ УСПЕШНО ДОБАВЛЕН!</b>\n\n"
+        f"📦 НАЗВАНИЕ: <b>{data['name']}</b>\n"
+        f"💰 ЦЕНА: <code>{data['price']} ₽</code>\n"
+        f"🌍 РЕГИОН: {result['region']}\n"
+        f"📅 ГОД: {result['year']}\n"
+        f"🔑 ПАРОЛЬ: <code>{data.get('account_password', 'НЕТ')}</code>\n"
+        f"🆔 ID: <code>{pid}</code>"
+    )
+    await state.clear()
+
+# ----- УДАЛЕНИЕ ТОВАРА -----
+@dp.callback_query(F.data == "admin_delete_product")
+async def admin_delete_product(callback: types.CallbackQuery):
+    products = get_products()
+    if not products:
+        await safe_edit_message(callback.message, "📭 НЕТ ТОВАРОВ.")
+        await callback.answer()
+        return
+    
+    buttons = []
+    for prod in products:
+        pid, name, price, *_ = prod
+        buttons.append([InlineKeyboardButton(text=f"{name} | {price} ₽", callback_data=f"del_{pid}")])
+    buttons.append([InlineKeyboardButton(text="🔙 НАЗАД", callback_data="admin_back")])
+    
+    await safe_edit_message(
+        callback.message,
+        "🗑 <b>ВЫБЕРИ ТОВАР ДЛЯ УДАЛЕНИЯ:</b>",
+        InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith('del_'))
+async def confirm_delete(callback: types.CallbackQuery):
+    pid = int(callback.data.split('_')[1])
+    delete_product(pid)
+    await safe_edit_message(callback.message, "✅ ТОВАР УДАЛЕН!")
+    await callback.answer()
+
+# ----- СПИСОК ТОВАРОВ -----
+@dp.callback_query(F.data == "admin_list_products")
+async def admin_list_products(callback: types.CallbackQuery):
+    products = get_products()
+    if not products:
+        await safe_edit_message(callback.message, "📭 НЕТ ТОВАРОВ.")
+        await callback.answer()
+        return
+    
+    text = "📦 <b>СПИСОК ТОВАРОВ:</b>\n\n"
+    for prod in products:
+        pid, name, price, phone, session, region, year, added = prod[:8]
+        text += f"🆔 <code>{pid}</code> | {name} | <code>{price} ₽</code> | {region} | {year}\n"
+    
+    await safe_edit_message(callback.message, text)
+    await callback.answer()
+
+# ----- СТАТИСТИКА -----
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats(callback: types.CallbackQuery):
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    
+    c.execute("SELECT COUNT(*) FROM users")
+    users = c.fetchone()[0]
+    
+    c.execute("SELECT COUNT(*) FROM products")
+    products = c.fetchone()[0]
+    
+    c.execute("SELECT COUNT(*) FROM purchases")
+    purchases = c.fetchone()[0]
+    
+    c.execute("SELECT SUM(price) FROM purchases")
+    revenue = c.fetchone()[0] or 0
+    
+    conn.close()
+    
+    text = (
+        f"📊 <b>СТАТИСТИКА</b>\n\n"
+        f"👥 ПОЛЬЗОВАТЕЛЕЙ: <b>{users}</b>\n"
+        f"📦 ТОВАРОВ: <b>{products}</b>\n"
+        f"🛒 ПРОДАЖ: <b>{purchases}</b>\n"
+        f"💰 ВЫРУЧКА: <b>{revenue} ₽</b>"
+    )
+    await safe_edit_message(callback.message, text)
+    await callback.answer()
+
+# ----- НАЧИСЛЕНИЕ БАЛАНСА -----
+@dp.callback_query(F.data == "admin_add_balance")
+async def admin_add_balance_start(callback: types.CallbackQuery, state: FSMContext):
+    await safe_edit_message(callback.message, "💰 ВВЕДИ ID ПОЛЬЗОВАТЕЛЯ:")
+    await state.set_state(AdminAddBalanceStates.waiting_for_user_id)
+    await callback.answer()
+
+@dp.message(AdminAddBalanceStates.waiting_for_user_id)
+async def admin_add_balance_user_id(message: types.Message, state: FSMContext):
+    try:
+        uid = int(message.text.strip())
+        user = get_user(uid)
+        if not user:
+            await message.answer("❌ ПОЛЬЗОВАТЕЛЬ НЕ НАЙДЕН")
+            return
+        await state.update_data(target_uid=uid)
+        await message.answer("💰 ВВЕДИ СУММУ:")
+        await state.set_state(AdminAddBalanceStates.waiting_for_amount)
+    except ValueError:
+        await message.answer("❌ ВВЕДИ ЧИСЛОВОЙ ID")
+
+@dp.message(AdminAddBalanceStates.waiting_for_amount)
+async def admin_add_balance_amount(message: types.Message, state: FSMContext):
+    try:
+        amount = float(message.text.strip())
+        if amount <= 0:
+            await message.answer("❌ СУММА ДОЛЖНА БЫТЬ > 0")
+            return
+        
+        data = await state.get_data()
+        uid = data['target_uid']
+        update_balance(uid, amount)
+        
+        await message.answer(f"✅ БАЛАНС {uid} ПОПОЛНЕН НА {amount} ₽")
+        
+        try:
+            await bot.send_message(uid, f"💰 <b>АДМИН ПОПОЛНИЛ ТВОЙ БАЛАНС НА {amount} ₽</b>")
+        except:
+            pass
+        
+        await state.clear()
+    except ValueError:
+        await message.answer("❌ ВВЕДИ ЧИСЛО")
+
+# ----- УПРАВЛЕНИЕ БАНАМИ -----
+@dp.callback_query(F.data == "admin_bans")
+async def admin_bans_menu(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    
+    banned = get_banned_users()
+    
+    text = f"🚫 <b>УПРАВЛЕНИЕ БАНАМИ</b>\n\n"
+    text += f"📊 Всего забанено: <b>{len(banned)}</b>\n\n"
+    
+    buttons = []
+    for user_id, username, reason, date in banned[:5]:
+        short_name = username or f"ID {user_id}"
+        buttons.append([InlineKeyboardButton(
+            text=f"🔨 {short_name[:20]}",
+            callback_data=f"unban_{user_id}"
+        )])
+    
+    buttons.append([InlineKeyboardButton(text="🔙 НАЗАД", callback_data="admin_back")])
+    
+    await safe_edit_message(callback.message, text, InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith('unban_'))
+async def admin_unban(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    
+    user_id = int(callback.data.split('_')[1])
+    unban_user(user_id)
+    await safe_edit_message(callback.message, f"✅ Пользователь {user_id} разбанен!")
+    await callback.answer()
+        
