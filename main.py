@@ -1161,4 +1161,469 @@ async def referral_system(message: types.Message):
     await message.answer(text, reply_markup=referral_keyboard())
 
 @dp.callback_query(F.data == "show_ref_link")
-async def show_ref_link(callback: types.Callback
+async def show_ref_link(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    log_user_action(user_id, "show_ref_link")
+    
+    user = get_user(user_id)
+    if not user:
+        await safe_edit_message(callback.message, "❌ ОШИБКА: ПОЛЬЗОВАТЕЛЬ НЕ НАЙДЕН.")
+        await callback.answer()
+        return
+    
+    if not user[5]:
+        new_code = generate_referral_code(user_id)
+        conn = sqlite3.connect('shop.db')
+        c = conn.cursor()
+        c.execute("UPDATE users SET referral_code = ? WHERE user_id = ?", (new_code, user_id))
+        conn.commit()
+        conn.close()
+        user = get_user(user_id)
+    
+    referral_link = f"https://t.me/{bot_username}?start=ref_{user[5]}"
+    text = (
+        f"🔗 <b>ТВОЯ РЕФЕРАЛЬНАЯ ССЫЛКА:</b>\n\n"
+        f"<code>{referral_link}</code>\n\n"
+        f"📤 ОТПРАВЛЯЙ ЕЁ ДРУЗЬЯМ И ПОЛУЧАЙ {get_setting('referral_reward')}% ОТ ИХ ПОПОЛНЕНИЙ!"
+    )
+    await safe_edit_message(callback.message, text, referral_keyboard())
+    await callback.answer()
+
+@dp.callback_query(F.data == "ref_stats")
+async def ref_stats(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    log_user_action(user_id, "ref_stats")
+    
+    stats = get_referral_stats(user_id)
+    text = f"📊 <b>СТАТИСТИКА РЕФЕРАЛОВ</b>\n\n"
+    text += f"👥 ПРИГЛАШЕНО: <b>{stats['total_count']}</b>\n"
+    text += f"💰 ЗАРАБОТАНО: <b>{stats['total_earnings']} ₽</b>\n\n"
+    
+    if stats['referrals']:
+        text += "СПИСОК РЕФЕРАЛОВ:\n"
+        for ref in stats['referrals']:
+            username = ref[0] if ref[0] else "БЕЗ USERNAME"
+            date = ref[1][:10] if ref[1] else "НЕИЗВЕСТНО"
+            text += f"👤 @{username} | 📅 {date}\n"
+    else:
+        text += "📭 У ТЕБЯ ПОКА НЕТ РЕФЕРАЛОВ."
+    
+    await safe_edit_message(callback.message, text, referral_keyboard())
+    await callback.answer()
+
+@dp.message(F.text == "📜 ПОКУПКИ")
+async def my_purchases(message: types.Message):
+    user_id = message.from_user.id
+    log_user_action(user_id, "purchases")
+    
+    if await auto_ban_spammer(user_id, message.from_user.username):
+        return
+    
+    purchases = get_user_purchases(user_id)
+    if not purchases:
+        await message.answer("📭 У ТЕБЯ ПОКА НЕТ ПОКУПОК.")
+        return
+    await message.answer("📜 <b>ТВОИ КУПЛЕННЫЕ АККАУНТЫ:</b>", reply_markup=purchases_keyboard(purchases))
+
+@dp.message(F.text == "📝 ОТЗЫВЫ")
+async def reviews_link(message: types.Message):
+    user_id = message.from_user.id
+    log_user_action(user_id, "reviews")
+    
+    if await auto_ban_spammer(user_id, message.from_user.username):
+        return
+    
+    channel_link = get_setting('reviews_channel_link')
+    if channel_link and channel_link != "не настроен":
+        await message.answer(
+            f"📢 <b>НАШ КАНАЛ С ОТЗЫВАМИ:</b>\n\n"
+            f"{channel_link}\n\n"
+            f"Там ты можешь почитать отзывы других покупателей!"
+        )
+    else:
+        await message.answer(
+            "📢 <b>КАНАЛ С ОТЗЫВАМИ ЕЩЁ НЕ НАСТРОЕН</b>\n\n"
+            "Администратор скоро добавит ссылку."
+        )
+
+@dp.message(F.text == "📞 ПОДДЕРЖКА")
+async def support(message: types.Message):
+    user_id = message.from_user.id
+    log_user_action(user_id, "support")
+    
+    if await auto_ban_spammer(user_id, message.from_user.username):
+        return
+    
+    text = (
+        "📞 <b>СЛУЖБА ПОДДЕРЖКИ</b>\n\n"
+        "ПО ВСЕМ ВОПРОСАМ ПИШИ СЮДА: @deaMorgan"
+    )
+    await message.answer(text)
+
+# ==================== ДЕТАЛИ ТОВАРА ====================
+@dp.callback_query(F.data == "refresh_catalog")
+async def refresh_catalog(callback: types.CallbackQuery):
+    log_user_action(callback.from_user.id, "refresh_catalog")
+    
+    products = get_products()
+    if not products:
+        await safe_edit_message(callback.message, "📭 КАТАЛОГ ПУСТ.")
+        await callback.answer()
+        return
+    await safe_edit_message(callback.message, "📦 <b>ВЫБЕРИ ТОВАР:</b>", catalog_keyboard(products))
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith('view_'))
+async def view_product(callback: types.CallbackQuery):
+    log_user_action(callback.from_user.id, "view_product")
+    
+    product_id = int(callback.data.split('_')[1])
+    product = get_product(product_id)
+    
+    if not product:
+        await safe_edit_message(callback.message, "❌ ТОВАР НЕ НАЙДЕН.")
+        await callback.answer()
+        return
+    
+    product_id, name, price, phone, session, region, year, added = product[:8]
+    age = datetime.now().year - year
+    stars_price = int(price / get_setting('stars_rate'))
+    
+    text = (
+        f"📦 <b>{name}</b>\n\n"
+        f"🌍 <b>РЕГИОН:</b> {region}\n"
+        f"📅 <b>ГОД СОЗДАНИЯ:</b> {year} ({age} ЛЕТ)\n"
+        f"💰 <b>ЦЕНА:</b> <code>{price} ₽</code> / {stars_price} ⭐\n"
+        f"🕐 <b>ДОБАВЛЕН:</b> {added[:10]}\n\n"
+        f"📱 ТЕЛЕФОН БУДЕТ ДОСТУПЕН ПОСЛЕ ПОКУПКИ."
+    )
+    
+    await safe_edit_message(callback.message, text, product_keyboard(product_id))
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith('buy_'))
+async def buy_product(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    log_user_action(user_id, "buy_product")
+    
+    product_id = int(callback.data.split('_')[1])
+    product = get_product(product_id)
+    
+    if not product:
+        await safe_edit_message(callback.message, "❌ ТОВАР НЕ НАЙДЕН.")
+        await callback.answer()
+        return
+    
+    if len(product) >= 9:
+        product_id, name, price, phone, session, region, year, added, password = product[:9]
+    else:
+        product_id, name, price, phone, session, region, year, added = product[:8]
+        password = None
+    
+    user_balance = get_balance(user_id)
+    
+    if user_balance >= price:
+        update_balance(user_id, -price)
+        
+        purchase_id = add_purchase(
+            user_id,
+            product_id,
+            price,
+            phone,
+            session,
+            region,
+            year,
+            password
+        )
+        
+        delete_product(product_id)
+        age = datetime.now().year - year
+        
+        text = (
+            f"✅ <b>ПОКУПКА УСПЕШНА!</b>\n\n"
+            f"📦 ТОВАР: <b>{name}</b>\n"
+            f"💰 ЦЕНА: <code>{price} ₽</code>\n"
+            f"🌍 РЕГИОН: {region}\n"
+            f"📅 ГОД: {year} ({age} ЛЕТ)\n"
+            f"📱 ТЕЛЕФОН: <code>{phone}</code>\n"
+        )
+        
+        if password and password not in ['None', '']:
+            text += f"🔑 ПАРОЛЬ АККАУНТА: <code>{password}</code>\n"
+        
+        text += f"\n📁 ФАЙЛ СЕССИИ ДОСТУПЕН В РАЗДЕЛЕ ПОКУПКИ"
+        
+        await safe_edit_message(callback.message, text)
+    else:
+        need = price - user_balance
+        await safe_edit_message(
+            callback.message,
+            f"❌ <b>НЕДОСТАТОЧНО СРЕДСТВ</b>\n\nНУЖНО ЕЩЕ: <code>{need} ₽</code>",
+            insufficient_balance_keyboard()
+        )
+    await callback.answer()
+
+# ==================== ДЕТАЛИ ПОКУПКИ ====================
+@dp.callback_query(lambda c: c.data.startswith('purchase_'))
+async def purchase_details(callback: types.CallbackQuery):
+    log_user_action(callback.from_user.id, "purchase_details")
+    
+    purchase_id = int(callback.data.split('_')[1])
+    purchase = get_purchase(purchase_id)
+    
+    if not purchase or purchase[1] != callback.from_user.id:
+        await safe_edit_message(callback.message, "❌ ПОКУПКА НЕ НАЙДЕНА.")
+        await callback.answer()
+        return
+    
+    pid, user_id, product_id, price, date, phone, session, region, year = purchase[:9]
+    
+    text = (
+        f"📱 <b>АККАУНТ #{pid}</b>\n\n"
+        f"📱 ТЕЛЕФОН: <code>{phone}</code>\n"
+        f"💰 ЦЕНА: <code>{price} ₽</code>\n"
+        f"🌍 РЕГИОН: {region}\n"
+        f"📅 ГОД АККАУНТА: {year}\n"
+        f"📦 КУПЛЕН: {date[:16]}\n\n"
+        f"ВЫБЕРИ ДЕЙСТВИЕ:"
+    )
+    await safe_edit_message(callback.message, text, purchase_actions_keyboard(pid))
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith('show_login_'))
+async def show_login(callback: types.CallbackQuery):
+    log_user_action(callback.from_user.id, "show_login")
+    
+    purchase_id = int(callback.data.split('_')[2])
+    purchase = get_purchase(purchase_id)
+    
+    if not purchase or purchase[1] != callback.from_user.id:
+        await safe_edit_message(callback.message, "❌ ПОКУПКА НЕ НАЙДЕНА.")
+        await callback.answer()
+        return
+    
+    if len(purchase) >= 10:
+        pid, user_id, product_id, price, date, phone, session, region, year, password = purchase[:10]
+    else:
+        pid, user_id, product_id, price, date, phone, session, region, year = purchase[:9]
+        password = None
+    
+    text = (
+        f"🔑 <b>ДАННЫЕ ДЛЯ ВХОДА (АККАУНТ #{pid})</b>\n\n"
+        f"📱 ТЕЛЕФОН: <code>{phone}</code>\n"
+        f"🔐 СЕССИЯ:\n<code>{session}</code>\n"
+    )
+    
+    if password and password not in ['None', 'пропустить', '']:
+        text += f"🔑 ПАРОЛЬ АККАУНТА: <code>{password}</code>\n\n"
+    else:
+        text += f"🔑 ПАРОЛЬ АККАУНТА: НЕ УСТАНОВЛЕН\n\n"
+    
+    text += "⚠️ СОХРАНИ ЭТИ ДАННЫЕ В БЕЗОПАСНОМ МЕСТЕ!"
+    
+    await safe_edit_message(callback.message, text, InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 НАЗАД", callback_data=f"purchase_{purchase_id}")]
+    ]))
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith('show_codes_'))
+async def show_codes(callback: types.CallbackQuery):
+    log_user_action(callback.from_user.id, "show_codes")
+    
+    purchase_id = int(callback.data.split('_')[2])
+    purchase = get_purchase(purchase_id)
+    
+    if not purchase or purchase[1] != callback.from_user.id:
+        await safe_edit_message(callback.message, "❌ ПОКУПКА НЕ НАЙДЕНА.")
+        await callback.answer()
+        return
+    
+    pid, user_id, product_id, price, date, phone, session, region, year = purchase[:9]
+    
+    msg = await safe_edit_message(callback.message, "🔄 ПОДКЛЮЧАЮСЬ К TELEGRAM АККАУНТУ...")
+    
+    try:
+        codes = await get_live_codes_from_account(session, limit=30)
+        
+        if not codes:
+            text = f"📨 <b>АККАУНТ #{pid}</b>\n\n❌ НЕТ КОДОВ В ЭТОМ АККАУНТЕ"
+        else:
+            text = f"📨 <b>КОДЫ ИЗ TELEGRAM (АККАУНТ #{pid})</b>:\n\n"
+            for i, code_data in enumerate(codes, 1):
+                star = "⭐ " if i == 1 else ""
+                text += f"{i}. {star}{code_data['type']} <code>{code_data['code']}</code>  |  🕐 {code_data['date']}\n"
+        
+        await safe_edit_message(msg, text, InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 ОБНОВИТЬ", callback_data=f"show_codes_{purchase_id}")],
+            [InlineKeyboardButton(text="🔙 НАЗАД", callback_data=f"purchase_{purchase_id}")]
+        ]))
+    except Exception as e:
+        await safe_edit_message(msg, f"❌ ОШИБКА: {str(e)[:100]}")
+    
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith('session_file_'))
+async def session_file(callback: types.CallbackQuery):
+    log_user_action(callback.from_user.id, "session_file")
+    
+    purchase_id = int(callback.data.split('_')[2])
+    purchase = get_purchase(purchase_id)
+    
+    if not purchase or purchase[1] != callback.from_user.id:
+        await safe_edit_message(callback.message, "❌ ПОКУПКА НЕ НАЙДЕНА.")
+        await callback.answer()
+        return
+    
+    pid, user_id, product_id, price, date, phone, session, region, year = purchase[:9]
+    
+    filename = f"session_{phone}.session"
+    with open(filename, 'w', encoding='utf-8') as f:
+        f.write(session)
+    
+    with open(filename, 'rb') as f:
+        await callback.message.answer_document(
+            FSInputFile(filename),
+            caption=f"📁 ФАЙЛ СЕССИИ ДЛЯ {phone}"
+        )
+    
+    os.remove(filename)
+    await callback.answer()
+
+# ==================== ПЛАТЕЖИ ====================
+@dp.callback_query(F.data == "show_payment_methods")
+async def show_payment_methods(callback: types.CallbackQuery):
+    log_user_action(callback.from_user.id, "show_payment_methods")
+    
+    await safe_edit_message(callback.message, "💰 <b>ВЫБЕРИ СПОСОБ ПОПОЛНЕНИЯ:</b>", payment_keyboard())
+    await callback.answer()
+
+@dp.callback_query(F.data == "pay_stars")
+async def pay_stars(callback: types.CallbackQuery, state: FSMContext):
+    log_user_action(callback.from_user.id, "pay_stars")
+    
+    await safe_edit_message(
+        callback.message,
+        f"⭐ <b>ПОПОЛНЕНИЕ ЧЕРЕЗ STARS</b>\n\n"
+        f"КУРС: 1 STAR = {get_setting('stars_rate')} ₽\n"
+        f"ВВЕДИ СУММУ В РУБЛЯХ:"
+    )
+    await state.set_state(PaymentStates.waiting_for_stars_amount)
+    await callback.answer()
+
+@dp.message(PaymentStates.waiting_for_stars_amount)
+async def stars_amount_handler(message: types.Message, state: FSMContext):
+    try:
+        amount = float(message.text)
+        final = amount
+        
+        if can_use_discount(message.from_user.id):
+            discount = get_setting('referral_discount')
+            final = amount * (1 - discount / 100)
+            apply_first_discount(message.from_user.id)
+        
+        stars_rate = get_setting('stars_rate')
+        stars = int(final / stars_rate)
+        
+        prices = [LabeledPrice(label="Пополнение баланса", amount=stars)]
+        payload = f"stars_{message.from_user.id}_{int(datetime.now().timestamp())}"
+        
+        invoice = await bot.create_invoice_link(
+            title="Пополнение баланса Stars",
+            description=f"{final} ₽ ({stars} ⭐)",
+            payload=payload,
+            currency="XTR",
+            prices=prices
+        )
+        
+        add_pending_payment(message.from_user.id, final, "stars", payload)
+        
+        text = (
+            f"⭐ <b>СЧЕТ СОЗДАН</b>\n\n"
+            f"💰 СУММА: <code>{final} ₽</code>\n"
+            f"⭐ STARS: <code>{stars}</code>"
+        )
+        
+        await message.answer(
+            text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💳 ОПЛАТИТЬ", url=invoice)]
+            ])
+        )
+        await state.clear()
+    except ValueError:
+        await message.answer("❌ ВВЕДИ ЧИСЛО")
+
+@dp.pre_checkout_query()
+async def pre_checkout_handler(pre_checkout_query: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+
+@dp.message(F.successful_payment)
+async def successful_payment_handler(message: types.Message):
+    payload = message.successful_payment.invoice_payload
+    
+    if payload.startswith("stars_"):
+        conn = sqlite3.connect('shop.db')
+        c = conn.cursor()
+        c.execute("SELECT id, user_id, amount FROM pending_payments WHERE invoice_id = ? AND status='pending'", (payload,))
+        payment = c.fetchone()
+        conn.close()
+        
+        if payment:
+            pid, uid, amt = payment
+            update_balance(uid, amt)
+            update_payment_status(pid, 'confirmed')
+            
+            user = get_user(uid)
+            if user and user[4]:
+                reward = amt * (get_setting('referral_reward') / 100)
+                update_balance(user[4], reward)
+            
+            await message.answer(f"✅ <b>БАЛАНС ПОПОЛНЕН НА {amt} ₽</b>")
+        else:
+            await message.answer("❌ ПЛАТЕЖ НЕ НАЙДЕН")
+
+@dp.callback_query(F.data == "pay_sbp")
+async def pay_sbp(callback: types.CallbackQuery, state: FSMContext):
+    log_user_action(callback.from_user.id, "pay_sbp")
+    
+    await safe_edit_message(
+        callback.message,
+        "💳 <b>ПОПОЛНЕНИЕ ЧЕРЕЗ СБП</b>\n\n"
+        "ВВЕДИ СУММУ (МИНИМУМ 100 ₽):"
+    )
+    await state.set_state(PaymentStates.waiting_for_sbp_amount)
+    await callback.answer()
+
+@dp.message(PaymentStates.waiting_for_sbp_amount)
+async def sbp_amount_handler(message: types.Message, state: FSMContext):
+    try:
+        amount = float(message.text)
+        if amount < 100:
+            await message.answer("❌ МИНИМАЛЬНАЯ СУММА 100 ₽. ВВЕДИ ДРУГУЮ:")
+            return
+        
+        final = amount
+        
+        if can_use_discount(message.from_user.id):
+            discount = get_setting('referral_discount')
+            final = amount * (1 - discount / 100)
+            apply_first_discount(message.from_user.id)
+        
+        payment_id = add_pending_payment(message.from_user.id, final, "sbp")
+        
+        for admin_id in ADMIN_IDS:
+            await bot.send_message(
+                admin_id,
+                f"💰 <b>ЗАПРОС НА ПОПОЛНЕНИЕ</b>\n\n"
+                f"👤 ПОЛЬЗОВАТЕЛЬ: @{message.from_user.username or 'НЕТ'} (ID: {message.from_user.id})\n"
+                f"💵 СУММА: {amount} ₽\n"
+                f"💳 К ОПЛАТЕ: {final} ₽\n"
+                f"🆔 ID ПЛАТЕЖА: {payment_id}",
+                reply_markup=admin_payment_keyboard(payment_id)
+            )
+        
+        await message.answer("✅ ЗАПРОС СОЗДАН. ОЖИДАЙ, АДМИНИСТРАТОР ОТПРАВИТ РЕКВИЗИТЫ.")
+        await state.clear()
+    except ValueError:
+        await message.answer("❌ ВВЕДИ ЧИСЛО")
+
