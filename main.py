@@ -32,7 +32,7 @@ from telethon.errors import (
 )
 
 # ==================== НАСТРОЙКИ ====================
-TOKEN = "8561605758:AAFOFA3pT3TTxzMQXWS8GxZXWGBKdlp9KpU"
+TOKEN = "8561605758:AAH7WUSKqYHm7zbOUkEapNP8_QSFQw9D0nA"
 CRYPTOBOT_TOKEN = "546557:AAA5MxwCASiCnPAQOnZ6cNkbhgnirFIrxhU"
 CRYPTOBOT_API_URL = "https://pay.crypt.bot/api"
 ADMIN_IDS = [7546928092]
