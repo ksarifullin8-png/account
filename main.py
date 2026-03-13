@@ -2140,3 +2140,277 @@ async def admin_unban(callback: types.CallbackQuery):
     await safe_edit_message(callback.message, f"✅ Пользователь {user_id} разбанен!")
     await callback.answer()
         
+# ----- РАССЫЛКА -----
+@dp.callback_query(F.data == "admin_mailing")
+async def admin_mailing_start(callback: types.CallbackQuery, state: FSMContext):
+    await safe_edit_message(
+        callback.message,
+        "📢 <b>ВВЕДИ ТЕКСТ ДЛЯ РАССЫЛКИ</b>\n\n"
+        "Доступны переменные:\n"
+        "• <code>{{name}}</code> — username\n"
+        "• <code>{{id}}</code> — ID пользователя\n\n"
+        "Можно использовать HTML-теги: <b>жирный</b>, <i>курсив</i>, <code>код</code>"
+    )
+    await state.set_state(MailingStates.waiting_for_message)
+    await callback.answer()
+
+@dp.message(MailingStates.waiting_for_message)
+async def admin_mailing_message(message: types.Message, state: FSMContext):
+    await state.update_data(text=message.text)
+    users = get_all_users()
+    
+    preview = message.text.replace("{{name}}", message.from_user.first_name or "User")
+    preview = preview.replace("{{id}}", str(message.from_user.id))
+    
+    await message.answer(
+        f"📢 <b>ПРЕДПРОСМОТР:</b>\n\n{preview}\n\n"
+        f"👥 ВСЕГО ПОЛЬЗОВАТЕЛЕЙ: <b>{len(users)}</b>\n\n"
+        f"✅ ОТПРАВИТЬ?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ ДА", callback_data="mailing_send")],
+            [InlineKeyboardButton(text="❌ НЕТ", callback_data="admin_back")]
+        ])
+    )
+    await state.set_state(MailingStates.waiting_for_confirm)
+
+@dp.callback_query(F.data == "mailing_send")
+async def admin_mailing_send(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    text = data['text']
+    
+    await safe_edit_message(callback.message, "🔄 НАЧИНАЮ РАССЫЛКУ...")
+    
+    users = get_all_users()
+    success = 0
+    failed = 0
+    
+    for uid, uname in users:
+        try:
+            user_text = text.replace("{{name}}", uname or "User").replace("{{id}}", str(uid))
+            await bot.send_message(uid, user_text)
+            success += 1
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            failed += 1
+            logger.error(f"Ошибка отправки {uid}: {e}")
+    
+    await safe_edit_message(
+        callback.message,
+        f"✅ <b>РАССЫЛКА ЗАВЕРШЕНА!</b>\n\n"
+        f"✅ УСПЕШНО: <b>{success}</b>\n"
+        f"❌ ОШИБОК: <b>{failed}</b>"
+    )
+    await state.clear()
+    await callback.answer()
+
+# ----- НАСТРОЙКИ -----
+@dp.callback_query(F.data == "admin_settings")
+async def admin_settings(callback: types.CallbackQuery):
+    stars = get_setting('stars_rate')
+    usdt = get_setting('usdt_rate')
+    discount = get_setting('referral_discount')
+    reward = get_setting('referral_reward')
+    
+    text = (
+        f"⚙️ <b>ТЕКУЩИЕ НАСТРОЙКИ:</b>\n\n"
+        f"⭐ STARS: 1 = <code>{stars} ₽</code>\n"
+        f"💵 USDT: 1 = <code>{usdt} ₽</code>\n"
+        f"🎁 СКИДКА: <b>{discount}%</b>\n"
+        f"💸 НАГРАДА: <b>{reward}%</b>"
+    )
+    await safe_edit_message(callback.message, text, admin_settings_keyboard())
+    await callback.answer()
+
+@dp.callback_query(F.data == "set_stars")
+async def set_stars(callback: types.CallbackQuery, state: FSMContext):
+    await safe_edit_message(
+        callback.message,
+        f"⭐ ТЕКУЩИЙ КУРС: <code>{get_setting('stars_rate')} ₽</code>\nВВЕДИ НОВЫЙ:"
+    )
+    await state.set_state(AdminSettingsStates.waiting_for_stars)
+    await callback.answer()
+
+@dp.message(AdminSettingsStates.waiting_for_stars)
+async def stars_set_handler(message: types.Message, state: FSMContext):
+    try:
+        rate = float(message.text)
+        if rate <= 0:
+            await message.answer("❌ ПОЛОЖИТЕЛЬНОЕ ЧИСЛО")
+            return
+        update_setting('stars_rate', rate)
+        await message.answer(f"✅ КУРС STARS: 1 = <code>{rate} ₽</code>")
+        await state.clear()
+    except ValueError:
+        await message.answer("❌ ВВЕДИ ЧИСЛО")
+
+@dp.callback_query(F.data == "set_usdt")
+async def set_usdt(callback: types.CallbackQuery, state: FSMContext):
+    await safe_edit_message(
+        callback.message,
+        f"💵 ТЕКУЩИЙ КУРС: <code>{get_setting('usdt_rate')} ₽</code>\nВВЕДИ НОВЫЙ:"
+    )
+    await state.set_state(AdminSettingsStates.waiting_for_usdt)
+    await callback.answer()
+
+@dp.message(AdminSettingsStates.waiting_for_usdt)
+async def usdt_set_handler(message: types.Message, state: FSMContext):
+    try:
+        rate = float(message.text)
+        if rate <= 0:
+            await message.answer("❌ ПОЛОЖИТЕЛЬНОЕ ЧИСЛО")
+            return
+        update_setting('usdt_rate', rate)
+        await message.answer(f"✅ КУРС USDT: 1 = <code>{rate} ₽</code>")
+        await state.clear()
+    except ValueError:
+        await message.answer("❌ ВВЕДИ ЧИСЛО")
+
+@dp.callback_query(F.data == "set_discount")
+async def set_discount(callback: types.CallbackQuery, state: FSMContext):
+    await safe_edit_message(
+        callback.message,
+        f"🎁 ТЕКУЩАЯ СКИДКА: <b>{get_setting('referral_discount')}%</b>\nВВЕДИ НОВУЮ (0-100):"
+    )
+    await state.set_state(AdminSettingsStates.waiting_for_discount)
+    await callback.answer()
+
+@dp.message(AdminSettingsStates.waiting_for_discount)
+async def discount_set_handler(message: types.Message, state: FSMContext):
+    try:
+        val = float(message.text)
+        if val < 0 or val > 100:
+            await message.answer("❌ ОТ 0 ДО 100")
+            return
+        update_setting('referral_discount', val)
+        await message.answer(f"✅ СКИДКА: <b>{val}%</b>")
+        await state.clear()
+    except ValueError:
+        await message.answer("❌ ВВЕДИ ЧИСЛО")
+
+@dp.callback_query(F.data == "set_reward")
+async def set_reward(callback: types.CallbackQuery, state: FSMContext):
+    await safe_edit_message(
+        callback.message,
+        f"💸 ТЕКУЩАЯ НАГРАДА: <b>{get_setting('referral_reward')}%</b>\nВВЕДИ НОВУЮ (0-100):"
+    )
+    await state.set_state(AdminSettingsStates.waiting_for_reward)
+    await callback.answer()
+
+@dp.message(AdminSettingsStates.waiting_for_reward)
+async def reward_set_handler(message: types.Message, state: FSMContext):
+    try:
+        val = float(message.text)
+        if val < 0 or val > 100:
+            await message.answer("❌ ОТ 0 ДО 100")
+            return
+        update_setting('referral_reward', val)
+        await message.answer(f"✅ НАГРАДА: <b>{val}%</b>")
+        await state.clear()
+    except ValueError:
+        await message.answer("❌ ВВЕДИ ЧИСЛО")
+
+@dp.callback_query(F.data == "set_reviews_channel")
+async def set_reviews_channel(callback: types.CallbackQuery, state: FSMContext):
+    current = get_setting('reviews_channel_link') or "не настроен"
+    await safe_edit_message(
+        callback.message,
+        f"📢 <b>НАСТРОЙКА КАНАЛА ДЛЯ ОТЗЫВОВ</b>\n\n"
+        f"Текущий канал: {current}\n\n"
+        f"Введите <b>ссылку на канал</b>:\n"
+        f"• Для публичного канала: @username или https://t.me/username\n"
+        f"• Для приватного канала: ссылка-приглашение https://t.me/+abc123"
+    )
+    await state.set_state(AdminSettingsStates.waiting_for_reviews_channel)
+    await callback.answer()
+
+@dp.message(AdminSettingsStates.waiting_for_reviews_channel)
+async def process_reviews_channel(message: types.Message, state: FSMContext):
+    channel_input = message.text.strip()
+    
+    if channel_input.startswith('@'):
+        channel_link = f"https://t.me/{channel_input[1:]}"
+    elif 't.me/' in channel_input:
+        channel_link = channel_input
+    else:
+        channel_link = f"https://t.me/{channel_input}"
+    
+    update_setting('reviews_channel_link', channel_link)
+    
+    await message.answer(
+        f"✅ <b>Канал для отзывов сохранен!</b>\n\n"
+        f"Ссылка: {channel_link}"
+    )
+    await state.clear()
+
+# ==================== НАВИГАЦИЯ ====================
+@dp.callback_query(F.data == "admin_back")
+async def admin_back(callback: types.CallbackQuery):
+    await safe_edit_message(callback.message, "⚙️ <b>АДМИН ПАНЕЛЬ</b>", admin_keyboard())
+    await callback.answer()
+
+@dp.callback_query(F.data == "back_to_catalog")
+async def back_to_catalog(callback: types.CallbackQuery):
+    products = get_products()
+    if not products:
+        await safe_edit_message(callback.message, "📭 КАТАЛОГ ПУСТ")
+        await callback.answer()
+        return
+    await safe_edit_message(callback.message, "📦 <b>ВЫБЕРИ ТОВАР:</b>", catalog_keyboard(products))
+    await callback.answer()
+
+@dp.callback_query(F.data == "back_to_balance")
+async def back_to_balance(callback: types.CallbackQuery):
+    bal = get_balance(callback.from_user.id)
+    stars_rate = get_setting('stars_rate')
+    text = (
+        f"💰 <b>ТВОЙ БАЛАНС:</b> <code>{bal} ₽</code>\n"
+        f"⭐ ЭКВИВАЛЕНТ: <code>{int(bal/stars_rate)} STARS</code>\n\n"
+        f"ВЫБЕРИ СПОСОБ ПОПОЛНЕНИЯ:"
+    )
+    await safe_edit_message(callback.message, text, payment_keyboard())
+    await callback.answer()
+
+@dp.callback_query(F.data == "back_to_purchases")
+async def back_to_purchases(callback: types.CallbackQuery):
+    purchases = get_user_purchases(callback.from_user.id)
+    if not purchases:
+        await safe_edit_message(callback.message, "📭 У ТЕБЯ НЕТ ПОКУПОК")
+        await callback.answer()
+        return
+    await safe_edit_message(callback.message, "📜 <b>ТВОИ ПОКУПКИ:</b>", purchases_keyboard(purchases))
+    await callback.answer()
+
+@dp.callback_query(F.data == "back_to_main")
+async def back_to_main(callback: types.CallbackQuery):
+    await cmd_start(callback.message)
+    await callback.answer()
+
+# ==================== ЗАПУСК ====================
+async def main():
+    """Главная функция запуска бота"""
+    global bot_username
+    
+    try:
+        bot_info = await bot.get_me()
+        bot_username = bot_info.username
+        
+        logger.info(f"🚀 БОТ @{bot_username} ЗАПУЩЕН!")
+        logger.info("✅ Все системы работают")
+        logger.info(f"👥 Администраторы: {ADMIN_IDS}")
+        
+        await dp.start_polling(bot, skip_updates=True)
+        
+    except Exception as e:
+        logger.error(f"❌ Критическая ошибка: {e}")
+        traceback.print_exc()
+    finally:
+        await bot.session.close()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("👋 Бот остановлен пользователем")
+    except Exception as e:
+        logger.error(f"❌ Ошибка: {e}")
+        traceback.print_exc()
