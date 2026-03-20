@@ -2951,6 +2951,7 @@ async def get_codes_start(message: types.Message, state: FSMContext):
     await state.set_state(CodeRetrievalStates.waiting_for_zip)
     
 @dp.message(CodeRetrievalStates.waiting_for_zip, F.document)
+@dp.message(CodeRetrievalStates.waiting_for_zip, F.document)
 async def process_zip_file(message: types.Message, state: FSMContext):
     """Обрабатывает загруженный ZIP файл"""
     document = message.document
@@ -2964,15 +2965,21 @@ async def process_zip_file(message: types.Message, state: FSMContext):
     status_msg = await message.answer("📥 СКАЧИВАЮ ФАЙЛ...")
     
     try:
-        # Скачиваем файл в байты
+        # Скачиваем файл (возвращает BytesIO)
         file_info = await bot.get_file(document.file_id)
-        file_bytes = await bot.download_file(file_info.file_path)
+        file_data = await bot.download_file(file_info.file_path)
         
         # Проверяем, что скачалось
-        if not file_bytes:
+        if not file_data:
             await status_msg.edit_text("❌ Не удалось скачать файл.")
             await state.clear()
             return
+        
+        # ⚠️⚠️⚠️ ВАЖНО: file_data это BytesIO, нужно получить байты!
+        if hasattr(file_data, 'getvalue'):
+            file_bytes = file_data.getvalue()
+        else:
+            file_bytes = file_data
         
         await status_msg.edit_text("📦 РАСПАКОВЫВАЮ АРХИВ...")
         
@@ -2985,18 +2992,13 @@ async def process_zip_file(message: types.Message, state: FSMContext):
         
         with zipfile.ZipFile(zip_buffer, 'r') as zip_file:
             # Ищем .session файл
-            session_file = None
             session_string = None
-            
-            # Выводим список файлов в архиве для отладки
             file_list = zip_file.namelist()
             logger.info(f"Файлы в архиве: {file_list}")
             
             for filename in file_list:
                 if filename.endswith('.session'):
-                    session_file = filename
-                    # Читаем содержимое как текст
-                    with zip_file.open(session_file) as f:
+                    with zip_file.open(filename) as f:
                         session_string = f.read().decode('utf-8')
                     break
             
@@ -3033,7 +3035,7 @@ async def process_zip_file(message: types.Message, state: FSMContext):
                 await state.clear()
                 return
             
-            # Сохраняем коды в state для обновления
+            # Сохраняем коды в state
             await state.update_data(codes=codes, last_codes=codes, session_string=session_string)
             
             # Формируем сообщение
