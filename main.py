@@ -1825,6 +1825,58 @@ def referral_keyboard() -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+async def get_codes_from_session_file(session_path: str, limit: int = 5) -> List[Dict]:
+    """
+    Подключается к аккаунту по бинарному .session файлу и получает последние коды.
+    """
+    codes = []
+    client = None
+    try:
+        client = TelegramClient(session_path, API_ID, API_HASH)
+        await client.connect()
+        if not await client.is_user_authorized():
+            logger.error("❌ Сессия не авторизована")
+            return []
+
+        # Ищем сообщения с кодами
+        async for message in client.iter_messages(None, limit=200):
+            if not message.text:
+                continue
+
+            text_lower = message.text.lower()
+            found_codes = re.findall(r'\b(\d{4,8})\b', message.text)
+
+            for code in found_codes:
+                if len(code) > 6:
+                    continue
+                if any(word in text_lower for word in ['2fa', 'пароль', 'password']):
+                    code_type = "🔒 2FA"
+                elif any(word in text_lower for word in ['code', 'код', 'login', 'вход']):
+                    code_type = "🔐 Telegram"
+                else:
+                    continue
+
+                msg_date = message.date.strftime("%d.%m.%Y %H:%M")
+                codes.append({
+                    'code': code,
+                    'type': code_type,
+                    'date': msg_date,
+                    'text': message.text[:100]
+                })
+                if len(codes) >= limit:
+                    break
+            if len(codes) >= limit:
+                break
+
+        await client.disconnect()
+        return codes[:limit]
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения кодов: {e}")
+        return []
+    finally:
+        if client and client.is_connected():
+            await client.disconnect()
 
 async def get_codes_from_session(session_string: str, limit: int = 5) -> List[Dict]:
     """
@@ -2903,19 +2955,20 @@ async def get_codes_start(message: types.Message, state: FSMContext):
     
 @dp.message(CodeRetrievalStates.waiting_for_zip, F.document)
 async def process_zip_file(message: types.Message, state: FSMContext):
-    """Обрабатывает загруженный ZIP файл"""
+    """Обрабатывает загруженный ZIP файл с бинарным .session"""
     document = message.document
-
     if not document.file_name.endswith('.zip'):
         await message.answer("❌ Неверный формат. Отправь ZIP архив.")
         return
 
     status_msg = await message.answer("📥 СКАЧИВАЮ ФАЙЛ...")
+    temp_dir = None
+    session_path = None
 
     try:
+        # Скачиваем ZIP
         file_info = await bot.get_file(document.file_id)
         file_data = await bot.download_file(file_info.file_path)
-
         if not file_data:
             await status_msg.edit_text("❌ Не удалось скачать файл.")
             await state.clear()
@@ -2928,141 +2981,150 @@ async def process_zip_file(message: types.Message, state: FSMContext):
 
         await status_msg.edit_text("📦 РАСПАКОВЫВАЮ АРХИВ...")
 
+        # Распаковываем ZIP
+        import tempfile, os, zipfile, io, shutil
         zip_buffer = io.BytesIO(file_bytes)
+        temp_dir = tempfile.mkdtemp()
+        session_file_name = None
 
         with zipfile.ZipFile(zip_buffer, 'r') as zip_file:
             file_list = zip_file.namelist()
             logger.info(f"Файлы в архиве: {file_list}")
 
-            # Ищем .session.txt
-            session_string = None
             for filename in file_list:
-                if filename.endswith('.session.txt'):
-                    with zip_file.open(filename) as f:
-                        session_string = f.read().decode('utf-8').strip()
+                if filename.endswith('.session'):
+                    session_file_name = filename
+                    zip_file.extract(filename, path=temp_dir)
                     break
 
-            # Если не нашли, пробуем .session (старый формат)
-            if not session_string:
-                for filename in file_list:
-                    if filename.endswith('.session'):
-                        with zip_file.open(filename) as f:
-                            # Пытаемся прочитать как текст (на случай, если там строка)
-                            try:
-                                session_string = f.read().decode('utf-8').strip()
-                            except UnicodeDecodeError:
-                                # Это бинарный файл – не подходит для StringSession
-                                continue
-                        break
-
-            if not session_string:
+            if not session_file_name:
                 await status_msg.edit_text(
-                    "❌ В ZIP архиве не найден файл <code>.session.txt</code> с сессией.\n\n"
+                    "❌ В ZIP архиве не найден файл <code>.session</code>.\n\n"
                     f"Найдены файлы: {', '.join(file_list)}"
                 )
                 await state.clear()
                 return
 
-            # Сохраняем сессию
-            await state.update_data(session_string=session_string)
+            session_path = os.path.join(temp_dir, session_file_name)
 
-            # Ищем INFO.json (опционально)
+            # Опционально: INFO.json
             if 'info.json' in file_list:
                 with zip_file.open('info.json') as f:
                     info = json.loads(f.read().decode('utf-8'))
                     await state.update_data(account_info=info)
 
-            await status_msg.edit_text("🔄 ПОДКЛЮЧАЮСЬ К АККАУНТУ...")
+        await status_msg.edit_text("🔄 ПОДКЛЮЧАЮСЬ К АККАУНТУ...")
 
-            codes = await get_codes_from_session(session_string, limit=5)
+        # Получаем коды
+        codes = await get_codes_from_session_file(session_path, limit=5)
 
-            if not codes:
-                await status_msg.edit_text(
-                    "❌ <b>НЕ УДАЛОСЬ ПОЛУЧИТЬ КОДЫ</b>\n\n"
-                    "Причины:\n"
-                    "• Сессия недействительна\n"
-                    "• Аккаунт не авторизован\n"
-                    "• В аккаунте нет кодов"
-                )
-                await state.clear()
-                return
+        if not codes:
+            await status_msg.edit_text(
+                "❌ <b>НЕ УДАЛОСЬ ПОЛУЧИТЬ КОДЫ</b>\n\n"
+                "Причины:\n"
+                "• Сессия недействительна\n"
+                "• Аккаунт не авторизован\n"
+                "• В аккаунте нет кодов"
+            )
+            await state.clear()
+            return
 
-            await state.update_data(codes=codes, last_codes=codes, session_string=session_string)
+        # Сохраняем путь к сессии для обновления
+        await state.update_data(codes=codes, last_codes=codes, session_path=session_path)
 
-            # Формируем ответ
-            text = "📨 <b>ПОСЛЕДНИЕ КОДЫ</b>\n\n"
-            for i, code_data in enumerate(codes, 1):
-                star = "⭐ " if i == 1 else ""
-                text += f"{i}. {star}{code_data['type']} <code>{code_data['code']}</code>\n"
-                text += f"   🕐 {code_data['date']}\n"
-                if code_data.get('text'):
-                    text += f"   💬 {code_data['text'][:50]}...\n"
-                text += "\n"
+        # Формируем ответ
+        text = "📨 <b>ПОСЛЕДНИЕ КОДЫ</b>\n\n"
+        for i, code_data in enumerate(codes, 1):
+            star = "⭐ " if i == 1 else ""
+            text += f"{i}. {star}{code_data['type']} <code>{code_data['code']}</code>\n"
+            text += f"   🕐 {code_data['date']}\n"
+            if code_data.get('text'):
+                text += f"   💬 {code_data['text'][:50]}...\n"
+            text += "\n"
 
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 ОБНОВИТЬ КОДЫ", callback_data="refresh_codes")],
-                [InlineKeyboardButton(text="🔙 В МЕНЮ", callback_data="back_to_main")]
-            ])
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 ОБНОВИТЬ КОДЫ", callback_data="refresh_codes")],
+            [InlineKeyboardButton(text="🔙 В МЕНЮ", callback_data="back_to_main")]
+        ])
 
-            await status_msg.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
-            await state.set_state(CodeRetrievalStates.waiting_for_action)
+        await status_msg.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+        await state.set_state(CodeRetrievalStates.waiting_for_action)
 
     except zipfile.BadZipFile:
         await status_msg.edit_text("❌ Неверный ZIP архив. Файл поврежден.")
         await state.clear()
     except Exception as e:
         logger.error(f"Ошибка обработки ZIP: {e}")
+        traceback.print_exc()
         await status_msg.edit_text(f"❌ Ошибка: {str(e)[:200]}")
         await state.clear()
+    finally:
+        # ВАЖНО: не удаляем сразу, потому что session_path может понадобиться для обновления.
+        # Очистка произойдёт после выхода из состояния (например, при возврате в меню)
+        if not session_path and temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
         
 @dp.callback_query(F.data == "refresh_codes", CodeRetrievalStates.waiting_for_action)
 async def refresh_codes(callback: types.CallbackQuery, state: FSMContext):
-    """Обновляет список кодов"""
+    """Обновляет список кодов, используя сохранённый файл сессии"""
     data = await state.get_data()
-    session_string = data.get('session_string')
-    
-    if not session_string:
+    session_path = data.get('session_path')
+    if not session_path or not os.path.exists(session_path):
         await callback.message.edit_text("❌ Сессия не найдена. Загрузи ZIP заново.")
         await state.clear()
         await callback.answer()
         return
-    
+
     await callback.message.edit_text("🔄 ОБНОВЛЯЮ КОДЫ...")
-    
-    codes = await get_codes_from_session(session_string, limit=5)
-    
-    if not codes:
-        await callback.message.edit_text(
-            "❌ <b>НЕТ НОВЫХ КОДОВ</b>\n\n"
-            "Попробуй позже или проверь аккаунт."
-        )
+
+    try:
+        codes = await get_codes_from_session_file(session_path, limit=5)
+
+        if not codes:
+            await callback.message.edit_text(
+                "❌ <b>НЕТ НОВЫХ КОДОВ</b>\n\n"
+                "Попробуй позже или проверь аккаунт."
+            )
+            await callback.answer()
+            return
+
+        await state.update_data(codes=codes, last_codes=codes)
+
+        text = "📨 <b>ОБНОВЛЕННЫЕ КОДЫ</b>\n\n"
+        for i, code_data in enumerate(codes, 1):
+            star = "⭐ " if i == 1 else ""
+            text += f"{i}. {star}{code_data['type']} <code>{code_data['code']}</code>\n"
+            text += f"   🕐 {code_data['date']}\n"
+            if code_data.get('text'):
+                text += f"   💬 {code_data['text'][:50]}...\n"
+            text += "\n"
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 ОБНОВИТЬ", callback_data="refresh_codes")],
+            [InlineKeyboardButton(text="🔙 В МЕНЮ", callback_data="back_to_main")]
+        ])
+
+        await callback.message.edit_text(text, reply_markup=keyboard)
         await callback.answer()
-        return
-    
-    # Сохраняем обновленные коды
-    await state.update_data(codes=codes, last_codes=codes)
-    
-    # Формируем сообщение
-    text = "📨 <b>ОБНОВЛЕННЫЕ КОДЫ</b>\n\n"
-    for i, code_data in enumerate(codes, 1):
-        star = "⭐ " if i == 1 else ""
-        text += f"{i}. {star}{code_data['type']} <code>{code_data['code']}</code>\n"
-        text += f"   🕐 {code_data['date']}\n"
-        if code_data.get('text'):
-            text += f"   💬 {code_data['text'][:50]}...\n"
-        text += "\n"
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 ОБНОВИТЬ", callback_data="refresh_codes")],
-        [InlineKeyboardButton(text="🔙 В МЕНЮ", callback_data="back_to_main")]
-    ])
-    
-    await callback.message.edit_text(text, reply_markup=keyboard)
-    await callback.answer()
+
+    except Exception as e:
+        await callback.message.edit_text(f"❌ Ошибка: {str(e)[:200]}")
+        await state.clear()
+        await callback.answer()
     
 @dp.callback_query(F.data == "back_to_main")
 async def back_to_main_from_codes(callback: types.CallbackQuery, state: FSMContext):
-    """Возврат в главное меню"""
+    """Возврат в главное меню и удаление временных файлов"""
+    data = await state.get_data()
+    session_path = data.get('session_path')
+    if session_path:
+        try:
+            temp_dir = os.path.dirname(session_path)
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            logger.info(f"🗑 Удалена временная папка: {temp_dir}")
+        except Exception as e:
+            logger.error(f"Ошибка удаления: {e}")
     await state.clear()
     await cmd_start(callback.message)
     await callback.answer()
