@@ -1612,7 +1612,7 @@ async def create_crypto_invoice(amount_rub: float) -> Optional[Dict]:
 
 async def create_session_zip(product_ids: List[int]) -> Optional[bytes]:
     """
-    Создаёт ZIP с РАБОЧИМИ .session файлами (SQLite) + JSON + README
+    Создаёт ZIP архив с текстовыми файлами сессий (StringSession) + JSON + README
     """
     try:
         conn = sqlite3.connect('shop.db')
@@ -1651,72 +1651,11 @@ async def create_session_zip(product_ids: List[int]) -> Optional[bytes]:
             for product in products_data:
                 phone_digits = product['phone_clean']
 
-                try:
-                    import tempfile
-                    import os
-                    from telethon import TelegramClient
-                    from telethon.sessions import StringSession
+                # === 1. Сохраняем строку сессии в .session.txt ===
+                session_text = product['session_string']
+                zip_file.writestr(f"{phone_digits}.session.txt", session_text)
 
-                    # === 1. создаём временную папку ===
-                    tmp_dir = tempfile.mkdtemp()
-                    session_path = os.path.join(tmp_dir, phone_digits)
-
-                    # === 2. клиент из StringSession ===
-                    client = TelegramClient(
-                        StringSession(product['session_string']),
-                        API_ID,
-                        API_HASH
-                    )
-                    await client.connect()
-                    
-                    # ⚠️⚠️⚠️ ИСПРАВЛЕННЫЙ ОТСТУП ⚠️⚠️⚠️
-                    if not await client.is_user_authorized():
-                        raise Exception("Сессия не авторизована")
-                    
-                    # 🔥 обязательно "активируем" сессию
-                    await client.get_me()
-
-                    # === 3. создаём файловую сессию ===
-                    file_client = TelegramClient(session_path, API_ID, API_HASH)
-                    await file_client.connect()
-
-                    file_client.session.auth_key = client.session.auth_key
-                    file_client.session.set_dc(
-                        client.session.dc_id,
-                        client.session.server_address,
-                        client.session.port
-                    )
-
-                    await file_client.session.save()
-                    await file_client.disconnect()
-                    await client.disconnect()
-
-                    # === 4. читаем файл ===
-                    session_file = session_path + ".session"
-
-                    with open(session_file, "rb") as f:
-                        session_data = f.read()
-
-                    # === 5. кладём в ZIP ===
-                    zip_file.writestr(f"{phone_digits}.session", session_data)
-
-                    # === 6. очистка ===
-                    os.remove(session_file)
-                    os.rmdir(tmp_dir)
-
-                    logger.info(f"✅ session создан: {phone_digits}")
-
-                except Exception as e:
-                    logger.error(f"❌ Ошибка session ({phone_digits}): {e}")
-                    traceback.print_exc()
-
-                    # fallback (если вдруг не получилось)
-                    zip_file.writestr(
-                        f"{phone_digits}.session.txt",
-                        product['session_string']
-                    )
-
-                # === JSON ===
+                # === 2. JSON ===
                 json_data = {
                     'id': product['id'],
                     'name': product['name'],
@@ -1732,7 +1671,7 @@ async def create_session_zip(product_ids: List[int]) -> Optional[bytes]:
                     json.dumps(json_data, indent=2, ensure_ascii=False)
                 )
 
-                # === README на аккаунт ===
+                # === 3. README на аккаунт ===
                 readme = f"""АККАУНТ: {product['phone']}
 
 Телефон: {product['phone']}
@@ -1740,11 +1679,13 @@ async def create_session_zip(product_ids: List[int]) -> Optional[bytes]:
 Год: {product['year']}
 Пароль: {product['password'] if product['password'] else 'нет'}
 
-Использование:
+Использование в Python (Telethon):
 
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 
-client = TelegramClient('{phone_digits}.session', API_ID, API_HASH)
+session_str = open('{phone_digits}.session.txt', 'r').read()
+client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
 await client.connect()
 print(await client.get_me())
 """
@@ -1757,7 +1698,13 @@ print(await client.get_me())
 Всего: {len(products_data)}
 Дата: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
-.session файлы = Главный файл твоего аккаунта!
+В папке лежат файлы:
+
+- *.session.txt – строковые сессии (используйте с StringSession)
+- *.json – информация об аккаунте
+- README_*.txt – инструкция по использованию
+
+Для авторизации используйте StringSession.
 """
 
             zip_file.writestr("README.txt", total_readme)
@@ -2955,79 +2902,80 @@ async def get_codes_start(message: types.Message, state: FSMContext):
     await state.set_state(CodeRetrievalStates.waiting_for_zip)
     
 @dp.message(CodeRetrievalStates.waiting_for_zip, F.document)
-@dp.message(CodeRetrievalStates.waiting_for_zip, F.document)
 async def process_zip_file(message: types.Message, state: FSMContext):
     """Обрабатывает загруженный ZIP файл"""
     document = message.document
-    
-    # Проверяем расширение
+
     if not document.file_name.endswith('.zip'):
         await message.answer("❌ Неверный формат. Отправь ZIP архив.")
         return
-    
-    # Отправляем сообщение о загрузке
+
     status_msg = await message.answer("📥 СКАЧИВАЮ ФАЙЛ...")
-    
+
     try:
-        # Скачиваем файл (возвращает BytesIO)
         file_info = await bot.get_file(document.file_id)
         file_data = await bot.download_file(file_info.file_path)
-        
-        # Проверяем, что скачалось
+
         if not file_data:
             await status_msg.edit_text("❌ Не удалось скачать файл.")
             await state.clear()
             return
-        
-        # ⚠️⚠️⚠️ ВАЖНО: file_data это BytesIO, нужно получить байты!
+
         if hasattr(file_data, 'getvalue'):
             file_bytes = file_data.getvalue()
         else:
             file_bytes = file_data
-        
+
         await status_msg.edit_text("📦 РАСПАКОВЫВАЮ АРХИВ...")
-        
-        # Распаковываем ZIP
-        import zipfile
-        import io
-        
-        # Создаем BytesIO объект из байтов
+
         zip_buffer = io.BytesIO(file_bytes)
-        
+
         with zipfile.ZipFile(zip_buffer, 'r') as zip_file:
-            # Ищем .session файл
-            session_string = None
             file_list = zip_file.namelist()
             logger.info(f"Файлы в архиве: {file_list}")
-            
+
+            # Ищем .session.txt
+            session_string = None
             for filename in file_list:
-                if filename.endswith('.session'):
+                if filename.endswith('.session.txt'):
                     with zip_file.open(filename) as f:
-                        session_string = f.read().decode('utf-8')
+                        session_string = f.read().decode('utf-8').strip()
                     break
-            
+
+            # Если не нашли, пробуем .session (старый формат)
+            if not session_string:
+                for filename in file_list:
+                    if filename.endswith('.session'):
+                        with zip_file.open(filename) as f:
+                            # Пытаемся прочитать как текст (на случай, если там строка)
+                            try:
+                                session_string = f.read().decode('utf-8').strip()
+                            except UnicodeDecodeError:
+                                # Это бинарный файл – не подходит для StringSession
+                                continue
+                        break
+
             if not session_string:
                 await status_msg.edit_text(
-                    "❌ В ZIP архиве не найден файл <code>session.session</code>\n\n"
+                    "❌ В ZIP архиве не найден файл <code>.session.txt</code> с сессией.\n\n"
                     f"Найдены файлы: {', '.join(file_list)}"
                 )
                 await state.clear()
                 return
-            
-            # Сохраняем сессию в state
+
+            # Сохраняем сессию
             await state.update_data(session_string=session_string)
-            
+
             # Ищем INFO.json (опционально)
             if 'info.json' in file_list:
                 with zip_file.open('info.json') as f:
                     info = json.loads(f.read().decode('utf-8'))
                     await state.update_data(account_info=info)
-            
+
             await status_msg.edit_text("🔄 ПОДКЛЮЧАЮСЬ К АККАУНТУ...")
-            
-            # Получаем коды
+
             codes = await get_codes_from_session(session_string, limit=5)
-            
+
             if not codes:
                 await status_msg.edit_text(
                     "❌ <b>НЕ УДАЛОСЬ ПОЛУЧИТЬ КОДЫ</b>\n\n"
@@ -3038,11 +2986,10 @@ async def process_zip_file(message: types.Message, state: FSMContext):
                 )
                 await state.clear()
                 return
-            
-            # Сохраняем коды в state
+
             await state.update_data(codes=codes, last_codes=codes, session_string=session_string)
-            
-            # Формируем сообщение
+
+            # Формируем ответ
             text = "📨 <b>ПОСЛЕДНИЕ КОДЫ</b>\n\n"
             for i, code_data in enumerate(codes, 1):
                 star = "⭐ " if i == 1 else ""
@@ -3051,21 +2998,17 @@ async def process_zip_file(message: types.Message, state: FSMContext):
                 if code_data.get('text'):
                     text += f"   💬 {code_data['text'][:50]}...\n"
                 text += "\n"
-            
-            # Добавляем клавиатуру
+
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🔄 ОБНОВИТЬ КОДЫ", callback_data="refresh_codes")],
                 [InlineKeyboardButton(text="🔙 В МЕНЮ", callback_data="back_to_main")]
             ])
-            
+
             await status_msg.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
             await state.set_state(CodeRetrievalStates.waiting_for_action)
-            
+
     except zipfile.BadZipFile:
         await status_msg.edit_text("❌ Неверный ZIP архив. Файл поврежден.")
-        await state.clear()
-    except UnicodeDecodeError:
-        await status_msg.edit_text("❌ Ошибка чтения файла session.session. Возможно, файл поврежден.")
         await state.clear()
     except Exception as e:
         logger.error(f"Ошибка обработки ZIP: {e}")
