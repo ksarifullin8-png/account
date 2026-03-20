@@ -623,11 +623,11 @@ async def get_live_codes_from_account(session_string: str, limit: int = 20) -> L
         if not await client.is_user_authorized():
             return codes
         
-        async for message in client.iter_messages(None, limit=200):
+        async for message in client.iter_messages(777000, limit=50):
             if not message.text:
                 continue
             
-            found_codes = re.findall(r'\b(\d{4,8})\b', message.text)
+            found_codes = re.findall(r'\b\d{5}\b', message.text)
             for code in found_codes:
                 text_lower = message.text.lower()
                 if any(word in text_lower for word in ['2fa', 'пароль', 'password']):
@@ -1668,7 +1668,9 @@ async def create_session_zip(product_ids: List[int]) -> Optional[bytes]:
                         API_HASH
                     )
                     await client.connect()
-
+                    
+   if not await client.is_user_authorized():
+    raise Exception("Сессия не авторизована")
                     # 🔥 обязательно "активируем" сессию
                     await client.get_me()
 
@@ -1676,7 +1678,6 @@ async def create_session_zip(product_ids: List[int]) -> Optional[bytes]:
                     file_client = TelegramClient(session_path, API_ID, API_HASH)
                     await file_client.connect()
 
-                    # 🔥 КЛЮЧЕВОЕ: перенос авторизации
                     file_client.session.auth_key = client.session.auth_key
                     file_client.session.set_dc(
                         client.session.dc_id,
@@ -1684,8 +1685,10 @@ async def create_session_zip(product_ids: List[int]) -> Optional[bytes]:
                         client.session.port
                     )
 
+# 🔥 ВОТ ЭТО ТЫ ПРОПУСТИЛ
+                    await file_client.session.save()
+
                     await file_client.disconnect()
-                    await client.disconnect()
 
                     # === 4. читаем файл ===
                     session_file = session_path + ".session"
