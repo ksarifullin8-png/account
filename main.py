@@ -8,6 +8,9 @@ import os
 import requests
 import sys
 import traceback
+import zipfile
+import json
+import io
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple, Callable, Awaitable
 
@@ -19,7 +22,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton,
-    LabeledPrice, PreCheckoutQuery, FSInputFile
+    LabeledPrice, PreCheckoutQuery, FSInputFile,
+    BufferedInputFile  # ← ДОБАВЬ ЭТОТ ИМПОРТ
 )
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -28,8 +32,13 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import (
     SessionPasswordNeededError,
-    PhoneCodeInvalidError
+    PhoneCodeInvalidError,
+    PhoneMigrateError,
+    NetworkMigrateError
 )
+
+# УДАЛИ ЭТУ СТРОКУ:
+# from telethon.network import ConnectionTcpMTProxy
 
 # ==================== НАСТРОЙКИ ====================
 TOKEN = "8561605758:AAH7WUSKqYHm7zbOUkEapNP8_QSFQw9D0nA"
@@ -112,6 +121,10 @@ class AdminAddBalanceStates(StatesGroup):
     waiting_for_user_id = State()
     waiting_for_amount = State()
 
+class AdminDeleteStates(StatesGroup):
+    waiting_for_phone = State()
+    waiting_for_confirm = State()
+    
 class AdminSettingsStates(StatesGroup):
     waiting_for_stars = State()
     waiting_for_usdt = State()
@@ -122,6 +135,10 @@ class AdminSettingsStates(StatesGroup):
 class MailingStates(StatesGroup):
     waiting_for_message = State()
     waiting_for_confirm = State()
+    
+class CodeRetrievalStates(StatesGroup):
+    waiting_for_zip = State()
+    waiting_for_action = State()
 
 # ==================== БАЗА ДАННЫХ ====================
 def init_db():
@@ -358,6 +375,7 @@ def get_user(user_id: int, username: str = None, referrer_id: int = None) -> Opt
     c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
     user = c.fetchone()
     
+    # Если пользователя нет и передан username - создаем
     if not user and username:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         referral_code = generate_referral_code(user_id)
@@ -400,6 +418,24 @@ def apply_first_discount(user_id: int):
     c.execute("UPDATE users SET first_discount_used = 1 WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
+
+def load_proxies(filename="proxies.txt"):
+    """Загружает список прокси из файла"""
+    proxies = []
+    try:
+        with open(filename, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    # Поддерживаем форматы: ip:port, ip:port:user:pass, protocol://ip:port
+                    proxies.append(line)
+        logger.info(f"✅ Загружено {len(proxies)} прокси из {filename}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка загрузки прокси: {e}")
+    return proxies
+
+# Загружаем прокси при старте
+proxy_list = load_proxies()
 
 def get_referral_stats(user_id: int) -> Dict:
     conn = sqlite3.connect('shop.db')
@@ -485,15 +521,45 @@ def get_product(product_id: int) -> Optional[Tuple]:
     conn.close()
     return product
 
-def add_product(name: str, price: float, phone: str, session_string: str, region: str, year: int, password: str = None) -> int:
+def add_product(name: str, price: float, phone: str, session_string: str, region: str, year: int, 
+                password: str = None, spam_block: int = 0, register_date: str = None, account_age: int = 0) -> int:
+    """
+    Добавляет товар в базу данных.
+    """
     conn = sqlite3.connect('shop.db')
     c = conn.cursor()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     year = int(year) if year else datetime.now().year
     
-    c.execute("""INSERT INTO products (name, price, phone, session_string, region, account_year, added_date, password)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-              (name, price, phone, session_string, region, year, now, password))
+    # Проверяем и добавляем новые колонки если их нет
+    c.execute("PRAGMA table_info(products)")
+    columns = [col[1] for col in c.fetchall()]
+    
+    if 'spam_block' not in columns:
+        try:
+            c.execute("ALTER TABLE products ADD COLUMN spam_block INTEGER DEFAULT 0")
+            logger.info("✅ Добавлена колонка spam_block")
+        except:
+            pass
+    
+    if 'register_date' not in columns:
+        try:
+            c.execute("ALTER TABLE products ADD COLUMN register_date TEXT")
+            logger.info("✅ Добавлена колонка register_date")
+        except:
+            pass
+    
+    if 'account_age' not in columns:
+        try:
+            c.execute("ALTER TABLE products ADD COLUMN account_age INTEGER DEFAULT 0")
+            logger.info("✅ Добавлена колонка account_age")
+        except:
+            pass
+    
+    c.execute("""INSERT INTO products 
+                 (name, price, phone, session_string, region, account_year, added_date, password, spam_block, register_date, account_age)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+              (name, price, phone, session_string, region, year, now, password, spam_block, register_date, account_age))
     product_id = c.lastrowid
     conn.commit()
     conn.close()
@@ -626,13 +692,152 @@ def get_pending_payments_by_status(status: str = 'pending') -> List[Tuple]:
     return payments
 
 # ==================== TELEGRAM AUTH ====================
+async def get_account_info(client):
+    """
+    Получает информацию об аккаунте с определением даты регистрации.
+    Использует 3 разных метода для максимальной точности.
+    """
+    try:
+        info = {
+            'register_date': None,
+            'register_timestamp': 0,
+            'spam_block': 0,
+            'phone': None,
+            'username': None,
+            'first_name': None,
+            'last_name': None,
+            'account_age_days': 0,
+            'register_year': None
+        }
+        
+        me = await client.get_me()
+        info['phone'] = me.phone
+        info['username'] = me.username
+        info['first_name'] = me.first_name
+        info['last_name'] = me.last_name
+        
+        # 🔥🔥🔥 МЕТОД 1: Через authorizations (САМЫЙ ТОЧНЫЙ) 🔥🔥🔥
+        try:
+            from telethon.tl.functions.account import GetAuthorizationsRequest
+            auths = await client(GetAuthorizationsRequest())
+            
+            if auths and hasattr(auths, 'authorizations') and auths.authorizations:
+                # Самая старая авторизация = дата создания
+                sorted_auths = sorted(auths.authorizations, key=lambda x: x.date_created)
+                oldest = sorted_auths[0]
+                reg_timestamp = oldest.date_created
+                reg_date = datetime.fromtimestamp(reg_timestamp)
+                
+                info['register_date'] = reg_date.strftime("%Y-%m-%d")
+                info['register_timestamp'] = reg_timestamp
+                info['register_year'] = reg_date.year
+                
+                days_old = (datetime.now() - reg_date).days
+                info['account_age_days'] = days_old
+                
+                logger.info(f"✅ МЕТОД 1: Дата регистрации: {info['register_date']} (через authorizations)")
+                return info
+        except Exception as e:
+            logger.warning(f"⚠️ МЕТОД 1 не сработал: {e}")
+        
+        # 🔥🔥🔥 МЕТОД 2: Через дату создания профиля 🔥🔥🔥
+        try:
+            from telethon.tl.functions.users import GetUsersRequest
+            from telethon.tl.types import User
+            
+            users = await client(GetUsersRequest([me]))
+            if users and users[0]:
+                user = users[0]
+                # Проверяем разные поля с датами
+                if hasattr(user, 'date') and user.date:
+                    created_date = user.date
+                    if isinstance(created_date, datetime):
+                        info['register_date'] = created_date.strftime("%Y-%m-%d")
+                        info['register_timestamp'] = int(created_date.timestamp())
+                        info['register_year'] = created_date.year
+                        
+                        days_old = (datetime.now() - created_date).days
+                        info['account_age_days'] = days_old
+                        
+                        logger.info(f"✅ МЕТОД 2: Дата регистрации: {info['register_date']} (через profile)")
+                        return info
+        except Exception as e:
+            logger.warning(f"⚠️ МЕТОД 2 не сработал: {e}")
+        
+        # 🔥🔥🔥 МЕТОД 3: Через ID аккаунта 🔥🔥🔥
+        try:
+            if me.id:
+                # Формула для приблизительной даты по ID Telegram
+                # ID Telegram содержит информацию о дате регистрации
+                # Формула: (id - 1000000000000) / 2^22 ≈ timestamp
+                approx_timestamp = (me.id - 1000000000000) / 4194304
+                if approx_timestamp > 1262304000:  # > 2010 года
+                    approx_date = datetime.fromtimestamp(approx_timestamp)
+                    info['register_date'] = approx_date.strftime("%Y-%m-%d") + " (приблизительно)"
+                    info['register_timestamp'] = int(approx_timestamp)
+                    info['register_year'] = approx_date.year
+                    
+                    days_old = (datetime.now() - approx_date).days
+                    info['account_age_days'] = days_old
+                    
+                    logger.info(f"✅ МЕТОД 3: Дата регистрации: {info['register_date']} (по ID)")
+                    return info
+        except Exception as e:
+            logger.warning(f"⚠️ МЕТОД 3 не сработал: {e}")
+        
+        # 🔥🔥🔥 МЕТОД 4: Через год создания (fallback) 🔥🔥🔥
+        if hasattr(me, 'date') and me.date:
+            try:
+                year = me.date.year
+                info['register_year'] = year
+                info['register_date'] = f"{year}-01-01 (только год)"
+                logger.info(f"✅ МЕТОД 4: Год регистрации: {year}")
+            except:
+                pass
+        
+        # 🔥🔥🔥 ПРОВЕРКА СПАМБЛОКА 🔥🔥🔥
+        try:
+            # Пробуем отправить тестовое сообщение самому себе
+            from telethon.tl.functions.messages import SendMessageRequest
+            
+            await client(SendMessageRequest(
+                peer=await client.get_input_entity(me.id),
+                message="test",
+                random_id=random.randint(0, 2**63)
+            ))
+            info['spam_block'] = 0
+            logger.info("🚫 Спамблок: НЕТ")
+        except Exception as e:
+            error_str = str(e)
+            if 'FLOOD_WAIT' in error_str or 'RESTRICTED' in error_str:
+                info['spam_block'] = 1
+                logger.info("🚫 Спамблок: ЕСТЬ")
+            else:
+                info['spam_block'] = 0
+        
+        return info
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения информации: {e}")
+        traceback.print_exc()
+        return {
+            'register_date': None,
+            'register_timestamp': 0,
+            'spam_block': 0,
+            'phone': None,
+            'username': None,
+            'first_name': None,
+            'last_name': None,
+            'account_age_days': 0,
+            'register_year': None
+        }
+        
 async def detect_region(phone: str) -> str:
+    # Европа
     if phone.startswith('+7') or phone.startswith('7'):
         return '🇷🇺 Россия'
     elif phone.startswith('+380') or phone.startswith('380'):
         return '🇺🇦 Украина'
-    elif phone.startswith('+1'):
-        return '🇺🇸 США/Канада'
     elif phone.startswith('+44'):
         return '🇬🇧 Великобритания'
     elif phone.startswith('+49'):
@@ -643,6 +848,90 @@ async def detect_region(phone: str) -> str:
         return '🇮🇹 Италия'
     elif phone.startswith('+34'):
         return '🇪🇸 Испания'
+    elif phone.startswith('+351'):
+        return '🇵🇹 Португалия'
+    elif phone.startswith('+31'):
+        return '🇳🇱 Нидерланды'
+    elif phone.startswith('+32'):
+        return '🇧🇪 Бельгия'
+    elif phone.startswith('+41'):
+        return '🇨🇭 Швейцария'
+    elif phone.startswith('+43'):
+        return '🇦🇹 Австрия'
+    elif phone.startswith('+45'):
+        return '🇩🇰 Дания'
+    elif phone.startswith('+46'):
+        return '🇸🇪 Швеция'
+    elif phone.startswith('+47'):
+        return '🇳🇴 Норвегия'
+    elif phone.startswith('+48'):
+        return '🇵🇱 Польша'
+    elif phone.startswith('+420'):
+        return '🇨🇿 Чехия'
+    elif phone.startswith('+421'):
+        return '🇸🇰 Словакия'
+    elif phone.startswith('+36'):
+        return '🇭🇺 Венгрия'
+    elif phone.startswith('+385'):
+        return '🇭🇷 Хорватия'
+    elif phone.startswith('+386'):
+        return '🇸🇮 Словения'
+    elif phone.startswith('+40'):
+        return '🇷🇴 Румыния'
+    elif phone.startswith('+359'):
+        return '🇧🇬 Болгария'
+    elif phone.startswith('+30'):
+        return '🇬🇷 Греция'
+    elif phone.startswith('+90'):
+        return '🇹🇷 Турция'
+    elif phone.startswith('+357'):
+        return '🇨🇾 Кипр'
+    elif phone.startswith('+353'):
+        return '🇮🇪 Ирландия'
+    elif phone.startswith('+354'):
+        return '🇮🇸 Исландия'
+    elif phone.startswith('+352'):
+        return '🇱🇺 Люксембург'
+    elif phone.startswith('+356'):
+        return '🇲🇹 Мальта'
+    elif phone.startswith('+377'):
+        return '🇲🇨 Монако'
+    elif phone.startswith('+378'):
+        return '🇸🇲 Сан-Марино'
+    elif phone.startswith('+379'):
+        return '🇻🇦 Ватикан'
+    elif phone.startswith('+381'):
+        return '🇷🇸 Сербия'
+    elif phone.startswith('+382'):
+        return '🇲🇪 Черногория'
+    elif phone.startswith('+383'):
+        return '🇽🇰 Косово'
+    elif phone.startswith('+387'):
+        return '🇧🇦 Босния и Герцеговина'
+    elif phone.startswith('+389'):
+        return '🇲🇰 Северная Македония'
+    elif phone.startswith('+355'):
+        return '🇦🇱 Албания'
+    elif phone.startswith('+373'):
+        return '🇲🇩 Молдова'
+    elif phone.startswith('+40'):
+        return '🇷🇴 Румыния'
+    elif phone.startswith('+370'):
+        return '🇱🇹 Литва'
+    elif phone.startswith('+371'):
+        return '🇱🇻 Латвия'
+    elif phone.startswith('+372'):
+        return '🇪🇪 Эстония'
+    elif phone.startswith('+375'):
+        return '🇧🇾 Беларусь'
+    elif phone.startswith('+994'):
+        return '🇦🇿 Азербайджан'
+    elif phone.startswith('+374'):
+        return '🇦🇲 Армения'
+    elif phone.startswith('+995'):
+        return '🇬🇪 Грузия'
+    
+    # Азия
     elif phone.startswith('+86'):
         return '🇨🇳 Китай'
     elif phone.startswith('+81'):
@@ -651,23 +940,387 @@ async def detect_region(phone: str) -> str:
         return '🇰🇷 Южная Корея'
     elif phone.startswith('+91'):
         return '🇮🇳 Индия'
-    elif phone.startswith('+55'):
-        return '🇧🇷 Бразилия'
+    elif phone.startswith('+92'):
+        return '🇵🇰 Пакистан'
+    elif phone.startswith('+93'):
+        return '🇦🇫 Афганистан'
+    elif phone.startswith('+94'):
+        return '🇱🇰 Шри-Ланка'
+    elif phone.startswith('+95'):
+        return '🇲🇲 Мьянма'
+    elif phone.startswith('+960'):
+        return '🇲🇻 Мальдивы'
+    elif phone.startswith('+961'):
+        return '🇱🇧 Ливан'
+    elif phone.startswith('+962'):
+        return '🇯🇴 Иордания'
+    elif phone.startswith('+963'):
+        return '🇸🇾 Сирия'
+    elif phone.startswith('+964'):
+        return '🇮🇶 Ирак'
+    elif phone.startswith('+965'):
+        return '🇰🇼 Кувейт'
+    elif phone.startswith('+966'):
+        return '🇸🇦 Саудовская Аравия'
+    elif phone.startswith('+967'):
+        return '🇾🇪 Йемен'
+    elif phone.startswith('+968'):
+        return '🇴🇲 Оман'
+    elif phone.startswith('+971'):
+        return '🇦🇪 ОАЭ'
+    elif phone.startswith('+972'):
+        return '🇮🇱 Израиль'
+    elif phone.startswith('+973'):
+        return '🇧🇭 Бахрейн'
+    elif phone.startswith('+974'):
+        return '🇶🇦 Катар'
+    elif phone.startswith('+975'):
+        return '🇧🇹 Бутан'
+    elif phone.startswith('+976'):
+        return '🇲🇳 Монголия'
+    elif phone.startswith('+977'):
+        return '🇳🇵 Непал'
+    elif phone.startswith('+98'):
+        return '🇮🇷 Иран'
+    elif phone.startswith('+992'):
+        return '🇹🇯 Таджикистан'
+    elif phone.startswith('+993'):
+        return '🇹🇲 Туркменистан'
+    elif phone.startswith('+994'):
+        return '🇦🇿 Азербайджан'
+    elif phone.startswith('+995'):
+        return '🇬🇪 Грузия'
+    elif phone.startswith('+996'):
+        return '🇰🇬 Киргизия'
+    elif phone.startswith('+997'):
+        return '🇰🇿 Казахстан'
+    elif phone.startswith('+998'):
+        return '🇺🇿 Узбекистан'
+    
+    # Америка
+    elif phone.startswith('+1'):
+        return '🇺🇸 США/Канада'
     elif phone.startswith('+52'):
         return '🇲🇽 Мексика'
+    elif phone.startswith('+53'):
+        return '🇨🇺 Куба'
+    elif phone.startswith('+54'):
+        return '🇦🇷 Аргентина'
+    elif phone.startswith('+55'):
+        return '🇧🇷 Бразилия'
+    elif phone.startswith('+56'):
+        return '🇨🇱 Чили'
+    elif phone.startswith('+57'):
+        return '🇨🇴 Колумбия'
+    elif phone.startswith('+58'):
+        return '🇻🇪 Венесуэла'
+    elif phone.startswith('+591'):
+        return '🇧🇴 Боливия'
+    elif phone.startswith('+592'):
+        return '🇬🇾 Гайана'
+    elif phone.startswith('+593'):
+        return '🇪🇨 Эквадор'
+    elif phone.startswith('+594'):
+        return '🇬🇫 Французская Гвиана'
+    elif phone.startswith('+595'):
+        return '🇵🇾 Парагвай'
+    elif phone.startswith('+596'):
+        return '🇲🇶 Мартиника'
+    elif phone.startswith('+597'):
+        return '🇸🇷 Суринам'
+    elif phone.startswith('+598'):
+        return '🇺🇾 Уругвай'
+    elif phone.startswith('+599'):
+        return '🇧🇶 Бонэйр/Кюрасао'
+    
+    # Африка
+    elif phone.startswith('+20'):
+        return '🇪🇬 Египет'
+    elif phone.startswith('+27'):
+        return '🇿🇦 ЮАР'
+    elif phone.startswith('+211'):
+        return '🇸🇸 Южный Судан'
+    elif phone.startswith('+212'):
+        return '🇲🇦 Марокко'
+    elif phone.startswith('+213'):
+        return '🇩🇿 Алжир'
+    elif phone.startswith('+216'):
+        return '🇹🇳 Тунис'
+    elif phone.startswith('+218'):
+        return '🇱🇾 Ливия'
+    elif phone.startswith('+220'):
+        return '🇬🇲 Гамбия'
+    elif phone.startswith('+221'):
+        return '🇸🇳 Сенегал'
+    elif phone.startswith('+222'):
+        return '🇲🇷 Мавритания'
+    elif phone.startswith('+223'):
+        return '🇲🇱 Мали'
+    elif phone.startswith('+224'):
+        return '🇬🇳 Гвинея'
+    elif phone.startswith('+225'):
+        return '🇨🇮 Кот-дИвуар'
+    elif phone.startswith('+226'):
+        return '🇧🇫 Буркина-Фасо'
+    elif phone.startswith('+227'):
+        return '🇳🇪 Нигер'
+    elif phone.startswith('+228'):
+        return '🇹🇬 Того'
+    elif phone.startswith('+229'):
+        return '🇧🇯 Бенин'
+    elif phone.startswith('+230'):
+        return '🇲🇺 Маврикий'
+    elif phone.startswith('+231'):
+        return '🇱🇷 Либерия'
+    elif phone.startswith('+232'):
+        return '🇸🇱 Сьерра-Леоне'
+    elif phone.startswith('+233'):
+        return '🇬🇭 Гана'
+    elif phone.startswith('+234'):
+        return '🇳🇬 Нигерия'
+    elif phone.startswith('+235'):
+        return '🇹🇩 Чад'
+    elif phone.startswith('+236'):
+        return '🇨🇫 ЦАР'
+    elif phone.startswith('+237'):
+        return '🇨🇲 Камерун'
+    elif phone.startswith('+238'):
+        return '🇨🇻 Кабо-Верде'
+    elif phone.startswith('+239'):
+        return '🇸🇹 Сан-Томе'
+    elif phone.startswith('+240'):
+        return '🇬🇶 Экваториальная Гвинея'
+    elif phone.startswith('+241'):
+        return '🇬🇦 Габон'
+    elif phone.startswith('+242'):
+        return '🇨🇬 Республика Конго'
+    elif phone.startswith('+243'):
+        return '🇨🇩 ДР Конго'
+    elif phone.startswith('+244'):
+        return '🇦🇴 Ангола'
+    elif phone.startswith('+245'):
+        return '🇬🇼 Гвинея-Бисау'
+    elif phone.startswith('+246'):
+        return '🇮🇴 Диего-Гарсия'
+    elif phone.startswith('+247'):
+        return '🇦🇨 Остров Вознесения'
+    elif phone.startswith('+248'):
+        return '🇸🇨 Сейшелы'
+    elif phone.startswith('+249'):
+        return '🇸🇩 Судан'
+    elif phone.startswith('+250'):
+        return '🇷🇼 Руанда'
+    elif phone.startswith('+251'):
+        return '🇪🇹 Эфиопия'
+    elif phone.startswith('+252'):
+        return '🇸🇴 Сомали'
+    elif phone.startswith('+253'):
+        return '🇩🇯 Джибути'
+    elif phone.startswith('+254'):
+        return '🇰🇪 Кения'
+    elif phone.startswith('+255'):
+        return '🇹🇿 Танзания'
+    elif phone.startswith('+256'):
+        return '🇺🇬 Уганда'
+    elif phone.startswith('+257'):
+        return '🇧🇮 Бурунди'
+    elif phone.startswith('+258'):
+        return '🇲🇿 Мозамбик'
+    elif phone.startswith('+260'):
+        return '🇿🇲 Замбия'
+    elif phone.startswith('+261'):
+        return '🇲🇬 Мадагаскар'
+    elif phone.startswith('+262'):
+        return '🇷🇪 Реюньон'
+    elif phone.startswith('+263'):
+        return '🇿🇼 Зимбабве'
+    elif phone.startswith('+264'):
+        return '🇳🇦 Намибия'
+    elif phone.startswith('+265'):
+        return '🇲🇼 Малави'
+    elif phone.startswith('+266'):
+        return '🇱🇸 Лесото'
+    elif phone.startswith('+267'):
+        return '🇧🇼 Ботсвана'
+    elif phone.startswith('+268'):
+        return '🇸🇿 Эсватини'
+    elif phone.startswith('+269'):
+        return '🇰🇲 Коморы'
+    elif phone.startswith('+290'):
+        return '🇸🇭 Остров Святой Елены'
+    elif phone.startswith('+291'):
+        return '🇪🇷 Эритрея'
+    
+    # Океания
     elif phone.startswith('+61'):
         return '🇦🇺 Австралия'
-    elif phone.startswith('+57'):
-        return '🇸🇪 Швеция'
-    elif phone.startswith('+49'):
-        return '🇵🇱 Польша'
+    elif phone.startswith('+64'):
+        return '🇳🇿 Новая Зеландия'
+    elif phone.startswith('+62'):
+        return '🇮🇩 Индонезия'
+    elif phone.startswith('+63'):
+        return '🇵🇭 Филиппины'
+    elif phone.startswith('+65'):
+        return '🇸🇬 Сингапур'
+    elif phone.startswith('+66'):
+        return '🇹🇭 Таиланд'
+    elif phone.startswith('+60'):
+        return '🇲🇾 Малайзия'
+    elif phone.startswith('+673'):
+        return '🇧🇳 Бруней'
+    elif phone.startswith('+674'):
+        return '🇳🇷 Науру'
+    elif phone.startswith('+675'):
+        return '🇵🇬 Папуа - Новая Гвинея'
+    elif phone.startswith('+676'):
+        return '🇹🇴 Тонга'
+    elif phone.startswith('+677'):
+        return '🇸🇧 Соломоновы Острова'
+    elif phone.startswith('+678'):
+        return '🇻🇺 Вануату'
+    elif phone.startswith('+679'):
+        return '🇫🇯 Фиджи'
+    elif phone.startswith('+680'):
+        return '🇵🇼 Палау'
+    elif phone.startswith('+681'):
+        return '🇼🇫 Уоллис и Футуна'
+    elif phone.startswith('+682'):
+        return '🇨🇰 Острова Кука'
+    elif phone.startswith('+683'):
+        return '🇳🇺 Ниуэ'
+    elif phone.startswith('+685'):
+        return '🇼🇸 Самоа'
+    elif phone.startswith('+686'):
+        return '🇰🇮 Кирибати'
+    elif phone.startswith('+687'):
+        return '🇳🇨 Новая Каледония'
+    elif phone.startswith('+688'):
+        return '🇹🇻 Тувалу'
+    elif phone.startswith('+689'):
+        return '🇵🇫 Французская Полинезия'
+    
+    # Острова и территории
+    elif phone.startswith('+350'):
+        return '🇬🇮 Гибралтар'
+    elif phone.startswith('+352'):
+        return '🇱🇺 Люксембург'
+    elif phone.startswith('+353'):
+        return '🇮🇪 Ирландия'
+    elif phone.startswith('+354'):
+        return '🇮🇸 Исландия'
+    elif phone.startswith('+355'):
+        return '🇦🇱 Албания'
+    elif phone.startswith('+356'):
+        return '🇲🇹 Мальта'
+    elif phone.startswith('+357'):
+        return '🇨🇾 Кипр'
+    elif phone.startswith('+358'):
+        return '🇫🇮 Финляндия'
+    elif phone.startswith('+359'):
+        return '🇧🇬 Болгария'
+    elif phone.startswith('+298'):
+        return '🇫🇴 Фарерские острова'
+    elif phone.startswith('+299'):
+        return '🇬🇱 Гренландия'
+    elif phone.startswith('+500'):
+        return '🇫🇰 Фолкленды'
+    elif phone.startswith('+501'):
+        return '🇧🇿 Белиз'
+    elif phone.startswith('+502'):
+        return '🇬🇹 Гватемала'
+    elif phone.startswith('+503'):
+        return '🇸🇻 Сальвадор'
+    elif phone.startswith('+504'):
+        return '🇭🇳 Гондурас'
+    elif phone.startswith('+505'):
+        return '🇳🇮 Никарагуа'
+    elif phone.startswith('+506'):
+        return '🇨🇷 Коста-Рика'
+    elif phone.startswith('+507'):
+        return '🇵🇦 Панама'
+    elif phone.startswith('+508'):
+        return '🇵🇲 Сен-Пьер'
+    elif phone.startswith('+509'):
+        return '🇭🇹 Гаити'
+    elif phone.startswith('+590'):
+        return '🇬🇵 Гваделупа'
+    elif phone.startswith('+591'):
+        return '🇧🇴 Боливия'
+    elif phone.startswith('+592'):
+        return '🇬🇾 Гайана'
+    elif phone.startswith('+593'):
+        return '🇪🇨 Эквадор'
+    elif phone.startswith('+594'):
+        return '🇬🇫 Гвиана'
+    elif phone.startswith('+595'):
+        return '🇵🇾 Парагвай'
+    elif phone.startswith('+596'):
+        return '🇲🇶 Мартиника'
+    elif phone.startswith('+597'):
+        return '🇸🇷 Суринам'
+    elif phone.startswith('+598'):
+        return '🇺🇾 Уругвай'
+    elif phone.startswith('+599'):
+        return '🇨🇼 Кюрасао'
+    elif phone.startswith('+670'):
+        return '🇹🇱 Восточный Тимор'
+    elif phone.startswith('+671'):
+        return '🇬🇺 Гуам'
+    elif phone.startswith('+672'):
+        return '🇦🇶 Антарктида'
+    elif phone.startswith('+673'):
+        return '🇧🇳 Бруней'
+    elif phone.startswith('+674'):
+        return '🇳🇷 Науру'
+    elif phone.startswith('+675'):
+        return '🇵🇬 Папуа'
+    elif phone.startswith('+676'):
+        return '🇹🇴 Тонга'
+    elif phone.startswith('+677'):
+        return '🇸🇧 Соломоны'
+    elif phone.startswith('+678'):
+        return '🇻🇺 Вануату'
+    elif phone.startswith('+679'):
+        return '🇫🇯 Фиджи'
+    elif phone.startswith('+680'):
+        return '🇵🇼 Палау'
+    elif phone.startswith('+681'):
+        return '🇼🇫 Уоллис'
+    elif phone.startswith('+682'):
+        return '🇨🇚 Острова Кука'
+    elif phone.startswith('+683'):
+        return '🇳🇺 Ниуэ'
+    elif phone.startswith('+684'):
+        return '🇦🇸 Самоа'
+    elif phone.startswith('+685'):
+        return '🇼🇸 Самоа'
+    elif phone.startswith('+686'):
+        return '🇰🇮 Кирибати'
+    elif phone.startswith('+687'):
+        return '🇳🇨 Каледония'
+    elif phone.startswith('+688'):
+        return '🇹🇻 Тувалу'
+    elif phone.startswith('+689'):
+        return '🇵🇫 Полинезия'
+    elif phone.startswith('+690'):
+        return '🇹🇰 Токелау'
+    elif phone.startswith('+691'):
+        return '🇫🇲 Микронезия'
+    elif phone.startswith('+692'):
+        return '🇲🇭 Маршаллы'
+    elif phone.startswith('+800'):
+        return '🌐 Международный'
     else:
         return '🌍 Другая страна'
 
 async def login_to_telegram(phone: str) -> Dict[str, Any]:
+    """
+    Вход в Telegram аккаунт с использованием прокси.
+    """
     try:
         logger.info(f"🔄 Начинаем вход для номера: {phone}")
         
+        # Очищаем номер
         phone = re.sub(r'[^\d+]', '', phone)
         if not phone.startswith('+'):
             phone = '+' + phone
@@ -680,13 +1333,19 @@ async def login_to_telegram(phone: str) -> Dict[str, Any]:
             session_string = active_sessions[phone]
             client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
             await client.connect()
+            
             if await client.is_user_authorized():
                 me = await client.get_me()
                 logger.info(f"✅ Аккаунт уже авторизован: {me.phone}")
                 region = await detect_region(phone)
                 year = getattr(me, 'date', None)
                 year = year.year if year and hasattr(year, 'year') else datetime.now().year
-                temp_clients[phone] = client
+                
+                temp_clients[phone] = {
+                    'client': client,
+                    'phone_code_hash': None
+                }
+                
                 return {
                     'success': True,
                     'session': session_string,
@@ -697,11 +1356,11 @@ async def login_to_telegram(phone: str) -> Dict[str, Any]:
                     'client': client
                 }
         
-        # Создаем новую сессию
-        logger.info("🆕 Создаем новую сессию")
-        client = TelegramClient(StringSession(), API_ID, API_HASH)
+        # 🔥🔥🔥 СОЗДАЁМ КЛИЕНТА С ПРОКСИ 🔥🔥🔥
+        client = await create_client_with_proxy()
         await client.connect()
         
+        # Проверяем авторизацию
         if await client.is_user_authorized():
             me = await client.get_me()
             logger.info(f"✅ Уже авторизован: {me.phone}")
@@ -710,7 +1369,10 @@ async def login_to_telegram(phone: str) -> Dict[str, Any]:
             year = getattr(me, 'date', None)
             year = year.year if year and hasattr(year, 'year') else datetime.now().year
             active_sessions[phone] = session_string
-            temp_clients[phone] = client
+            temp_clients[phone] = {
+                'client': client,
+                'phone_code_hash': None
+            }
             return {
                 'success': True,
                 'session': session_string,
@@ -720,49 +1382,96 @@ async def login_to_telegram(phone: str) -> Dict[str, Any]:
                 'phone': phone,
                 'client': client
             }
-        else:
-            logger.info(f"📱 Отправляем код на {phone}")
-            await client.send_code_request(phone)
-            temp_clients[phone] = client
-            logger.info("✅ Код отправлен, ожидаем ввод")
-            return {'success': True, 'need_code': True, 'phone': phone, 'client': client}
+        
+        # Отправляем код
+        logger.info(f"📱 Отправляем код на {phone}")
+        
+        try:
+            result = await client.send_code_request(phone)
+        except PhoneMigrateError as e:
+            logger.info(f"🔄 Миграция в DC {e.new_dc}")
+            client.session.set_dc(e.new_dc)
+            await client.connect()
+            result = await client.send_code_request(phone)
+        
+        # Сохраняем данные
+        temp_clients[phone] = {
+            'client': client,
+            'phone_code_hash': result.phone_code_hash
+        }
+        
+        logger.info(f"✅ Код отправлен через прокси, phone_code_hash: {result.phone_code_hash}")
+        
+        return {
+            'success': True, 
+            'need_code': True, 
+            'phone': phone
+        }
     
     except Exception as e:
         logger.error(f"❌ Ошибка входа: {e}")
         traceback.print_exc()
         return {'success': False, 'error': str(e)}
-
+        
 async def verify_code(phone: str, code: str) -> Dict[str, Any]:
+    """
+    Подтверждение кода для виртуальных номеров.
+    """
     try:
         logger.info(f"\n🔍 VERIFY_CODE: Проверка кода для {phone}")
-        logger.info(f"🔍 VERIFY_CODE: Код: {code}")
         
-        client = temp_clients.get(phone)
-        if not client:
+        client_data = temp_clients.get(phone)
+        if not client_data:
             logger.error(f"❌ VERIFY_CODE: Клиент не найден!")
-            logger.info(f"🔍 VERIFY_CODE: Доступные ключи: {list(temp_clients.keys())}")
             return {'success': False, 'error': '❌ Сессия истекла'}
         
-        logger.info(f"✅ VERIFY_CODE: Клиент найден")
+        client = client_data.get('client')
+        phone_code_hash = client_data.get('phone_code_hash')
+        
+        if not client:
+            logger.error(f"❌ VERIFY_CODE: Клиент не найден в данных!")
+            return {'success': False, 'error': '❌ Ошибка данных клиента'}
         
         if not client.is_connected():
-            logger.info(f"🔄 VERIFY_CODE: Клиент не подключен, подключаем...")
             await client.connect()
         
-        logger.info(f"🔍 VERIFY_CODE: Отправляем код...")
-        await client.sign_in(code=code)
-        logger.info(f"✅ VERIFY_CODE: Код принят!")
+        try:
+            await client.sign_in(
+                phone=phone,
+                code=code,
+                phone_code_hash=phone_code_hash
+            )
+        except SessionPasswordNeededError:
+            logger.info("🔐 Требуется 2FA пароль")
+            temp_clients[phone] = {
+                'client': client,
+                'phone_code_hash': phone_code_hash
+            }
+            return {'success': True, 'need_password': True, 'phone': phone}
         
+        # ✅ После успешного входа получаем информацию об аккаунте
+        logger.info(f"✅ VERIFY_CODE: Код принят! Получаем данные аккаунта...")
+        
+        # 🔥🔥🔥 ПОЛУЧАЕМ ИНФОРМАЦИЮ ОБ АККАУНТЕ 🔥🔥🔥
+        account_info = await get_account_info(client)
+        
+        # Получаем информацию об аккаунте
         me = await client.get_me()
-        logger.info(f"✅ VERIFY_CODE: Аккаунт: {me.phone}")
-        
         session_string = client.session.save()
         region = await detect_region(phone)
         year = getattr(me, 'date', None)
         year = year.year if year and hasattr(year, 'year') else datetime.now().year
         
+        # Если account_info дала год, используем его
+        if account_info.get('register_year'):
+            year = account_info['register_year']
+        
         active_sessions[phone] = session_string
-        logger.info(f"✅ VERIFY_CODE: Сессия сохранена")
+        
+        temp_clients[phone] = {
+            'client': client,
+            'phone_code_hash': None
+        }
         
         return {
             'success': True,
@@ -770,12 +1479,9 @@ async def verify_code(phone: str, code: str) -> Dict[str, Any]:
             'region': region,
             'year': year,
             'phone': phone,
-            'client': client
+            'client': client,
+            'account_info': account_info
         }
-    
-    except SessionPasswordNeededError:
-        logger.info(f"🔐 VERIFY_CODE: Требуется 2FA пароль")
-        return {'success': True, 'need_password': True, 'phone': phone}
     
     except PhoneCodeInvalidError:
         logger.error(f"❌ VERIFY_CODE: Неверный код")
@@ -785,21 +1491,61 @@ async def verify_code(phone: str, code: str) -> Dict[str, Any]:
         logger.error(f"❌ VERIFY_CODE: Ошибка: {e}")
         traceback.print_exc()
         return {'success': False, 'error': str(e)}
-
+      
 async def verify_password(phone: str, password: str) -> Dict[str, Any]:
+    """
+    Подтверждение 2FA пароля с получением информации об аккаунте.
+    """
     try:
-        client = temp_clients.get(phone)
-        if not client:
+        logger.info(f"\n🔐 VERIFY_PASSWORD: Проверка 2FA для {phone}")
+        
+        # Получаем данные клиента из temp_clients
+        client_data = temp_clients.get(phone)
+        if not client_data:
+            logger.error(f"❌ VERIFY_PASSWORD: Клиент не найден!")
             return {'success': False, 'error': '❌ Сессия истекла'}
         
+        # Извлекаем клиент из словаря
+        client = client_data.get('client')
+        
+        if not client:
+            logger.error(f"❌ VERIFY_PASSWORD: Клиент не найден в данных!")
+            return {'success': False, 'error': '❌ Ошибка данных клиента'}
+        
+        logger.info(f"✅ VERIFY_PASSWORD: Клиент найден")
+        
+        # Подключаемся если нужно
+        if not client.is_connected():
+            logger.info(f"🔄 VERIFY_PASSWORD: Подключаемся...")
+            await client.connect()
+        
+        # Отправляем 2FA пароль
         await client.sign_in(password=password)
+        
+        logger.info(f"✅ VERIFY_PASSWORD: 2FA пароль принят!")
+        
+        # 🔥🔥🔥 ПОЛУЧАЕМ ИНФОРМАЦИЮ ОБ АККАУНТЕ 🔥🔥🔥
+        account_info = await get_account_info(client)
+        
+        # Получаем информацию об аккаунте
         me = await client.get_me()
         session_string = client.session.save()
         region = await detect_region(phone)
         year = getattr(me, 'date', None)
         year = year.year if year and hasattr(year, 'year') else datetime.now().year
         
+        # Если account_info дала год, используем его
+        if account_info.get('register_year'):
+            year = account_info['register_year']
+        
+        # Сохраняем сессию
         active_sessions[phone] = session_string
+        
+        # Обновляем temp_clients
+        temp_clients[phone] = {
+            'client': client,
+            'phone_code_hash': None
+        }
         
         return {
             'success': True,
@@ -807,11 +1553,13 @@ async def verify_password(phone: str, password: str) -> Dict[str, Any]:
             'region': region,
             'year': year,
             'phone': phone,
-            'client': client
+            'client': client,
+            'account_info': account_info
         }
     
     except Exception as e:
-        logger.error(f"❌ Verify password error: {e}")
+        logger.error(f"❌ VERIFY_PASSWORD: Ошибка: {e}")
+        traceback.print_exc()
         return {'success': False, 'error': str(e)}
 
 # ==================== КРИПТО ФУНКЦИИ ====================
@@ -862,13 +1610,170 @@ async def create_crypto_invoice(amount_rub: float) -> Optional[Dict]:
         logger.error(f"Crypto invoice error: {e}")
         return None
 
+async def create_session_zip(product_ids: List[int]) -> Optional[bytes]:
+    """
+    Создаёт ZIP с РАБОЧИМИ .session файлами (SQLite) + JSON + README
+    """
+    try:
+        conn = sqlite3.connect('shop.db')
+        c = conn.cursor()
+
+        products_data = []
+        for pid in product_ids:
+            c.execute("""
+                SELECT id, name, phone, session_string, password, region, account_year 
+                FROM products WHERE id = ?
+            """, (pid,))
+            product = c.fetchone()
+
+            if product and product[3]:
+                phone_clean = re.sub(r'[^\d]', '', product[2])
+                products_data.append({
+                    'id': product[0],
+                    'name': product[1],
+                    'phone': product[2],
+                    'phone_clean': phone_clean,
+                    'session_string': product[3],
+                    'password': product[4],
+                    'region': product[5],
+                    'year': product[6]
+                })
+
+        conn.close()
+
+        if not products_data:
+            return None
+
+        zip_buffer = io.BytesIO()
+
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+
+            for product in products_data:
+                phone_digits = product['phone_clean']
+
+                try:
+                    import tempfile
+                    import os
+                    from telethon import TelegramClient
+                    from telethon.sessions import StringSession
+
+                    # === 1. создаём временную папку ===
+                    tmp_dir = tempfile.mkdtemp()
+                    session_path = os.path.join(tmp_dir, phone_digits)
+
+                    # === 2. клиент из StringSession ===
+                    client = TelegramClient(
+                        StringSession(product['session_string']),
+                        API_ID,
+                        API_HASH
+                    )
+                    await client.connect()
+
+                    # 🔥 обязательно "активируем" сессию
+                    await client.get_me()
+
+                    # === 3. создаём файловую сессию ===
+                    file_client = TelegramClient(session_path, API_ID, API_HASH)
+                    await file_client.connect()
+
+                    # 🔥 КЛЮЧЕВОЕ: перенос авторизации
+                    file_client.session.auth_key = client.session.auth_key
+                    file_client.session.set_dc(
+                        client.session.dc_id,
+                        client.session.server_address,
+                        client.session.port
+                    )
+
+                    await file_client.disconnect()
+                    await client.disconnect()
+
+                    # === 4. читаем файл ===
+                    session_file = session_path + ".session"
+
+                    with open(session_file, "rb") as f:
+                        session_data = f.read()
+
+                    # === 5. кладём в ZIP ===
+                    zip_file.writestr(f"{phone_digits}.session", session_data)
+
+                    # === 6. очистка ===
+                    os.remove(session_file)
+                    os.rmdir(tmp_dir)
+
+                    logger.info(f"✅ session создан: {phone_digits}")
+
+                except Exception as e:
+                    logger.error(f"❌ Ошибка session ({phone_digits}): {e}")
+                    traceback.print_exc()
+
+                    # fallback (если вдруг не получилось)
+                    zip_file.writestr(
+                        f"{phone_digits}.session.txt",
+                        product['session_string']
+                    )
+
+                # === JSON ===
+                json_data = {
+                    'id': product['id'],
+                    'name': product['name'],
+                    'phone': product['phone'],
+                    'password': product['password'],
+                    'region': product['region'],
+                    'year': product['year'],
+                    'export_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                }
+
+                zip_file.writestr(
+                    f"{phone_digits}.json",
+                    json.dumps(json_data, indent=2, ensure_ascii=False)
+                )
+
+                # === README на аккаунт ===
+                readme = f"""АККАУНТ: {product['phone']}
+
+Телефон: {product['phone']}
+Регион: {product['region']}
+Год: {product['year']}
+Пароль: {product['password'] if product['password'] else 'нет'}
+
+Использование:
+
+from telethon import TelegramClient
+
+client = TelegramClient('{phone_digits}.session', API_ID, API_HASH)
+await client.connect()
+print(await client.get_me())
+"""
+
+                zip_file.writestr(f"README_{phone_digits}.txt", readme)
+
+            # === общий README ===
+            total_readme = f"""TELEGRAM АККАУНТЫ
+
+Всего: {len(products_data)}
+Дата: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+.session файлы = Главный файл твоего аккаунта!
+"""
+
+            zip_file.writestr("README.txt", total_readme)
+
+        zip_buffer.seek(0)
+        return zip_buffer.getvalue()
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка ZIP: {e}")
+        traceback.print_exc()
+        return None
+        
 # ==================== КЛАВИАТУРЫ ====================
 def main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
     buttons = [
         [KeyboardButton(text="🛍 КАТАЛОГ")],
         [KeyboardButton(text="💰 БАЛАНС"), KeyboardButton(text="👤 ПРОФИЛЬ")],
         [KeyboardButton(text="👥 РЕФЕРАЛЫ"), KeyboardButton(text="📜 ПОКУПКИ")],
-        [KeyboardButton(text="📝 ОТЗЫВЫ"), KeyboardButton(text="📞 ПОДДЕРЖКА")]
+        [KeyboardButton(text="📝 ОТЗЫВЫ"), KeyboardButton(text="📞 ПОДДЕРЖКА")],
+        [KeyboardButton(text="🔑 ПОЛУЧИТЬ КОДЫ")]  # ← НОВАЯ КНОПКА
     ]
     if user_id in ADMIN_IDS:
         buttons.append([KeyboardButton(text="⚙️ АДМИН")])
@@ -878,7 +1783,9 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(text="➕ ДОБАВИТЬ ТОВАР", callback_data="admin_add_product")],
         [InlineKeyboardButton(text="🗑 УДАЛИТЬ ТОВАР", callback_data="admin_delete_product")],
+        [InlineKeyboardButton(text="📱 УДАЛИТЬ ПО НОМЕРУ", callback_data="admin_delete_by_phone")],
         [InlineKeyboardButton(text="📦 СПИСОК ТОВАРОВ", callback_data="admin_list_products")],
+        [InlineKeyboardButton(text="📥 СКАЧАТЬ СЕССИИ", callback_data="admin_download_sessions")],
         [InlineKeyboardButton(text="📊 СТАТИСТИКА", callback_data="admin_stats")],
         [InlineKeyboardButton(text="💰 НАЧИСЛИТЬ БАЛАНС", callback_data="admin_add_balance")],
         [InlineKeyboardButton(text="📢 РАССЫЛКА", callback_data="admin_mailing")],
@@ -887,7 +1794,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔙 НАЗАД", callback_data="admin_back")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
-
+    
 def admin_settings_keyboard() -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(text="⭐ КУРС STARS", callback_data="set_stars")],
@@ -967,6 +1874,120 @@ def referral_keyboard() -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+
+async def get_codes_from_session(session_string: str, limit: int = 5) -> List[Dict]:
+    """
+    Подключается к аккаунту по сессии и получает последние коды.
+    Возвращает список словарей с кодом, типом, датой.
+    """
+    codes = []
+    client = None
+    try:
+        client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+        await client.connect()
+        
+        if not await client.is_user_authorized():
+            logger.error("❌ Сессия не авторизована")
+            return []
+        
+        logger.info("✅ Подключен к аккаунту, ищу коды...")
+        
+        # Ищем сообщения с кодами
+        async for message in client.iter_messages(None, limit=100):
+            if not message.text:
+                continue
+            
+            found_codes = re.findall(r'\b(\d{4,8})\b', message.text)
+            for code in found_codes:
+                text_lower = message.text.lower()
+                if any(word in text_lower for word in ['2fa', 'пароль', 'password']):
+                    code_type = "🔒 2FA"
+                elif any(word in text_lower for word in ['code', 'код', 'login', 'вход']):
+                    code_type = "🔐 Telegram"
+                else:
+                    continue
+                
+                msg_date = message.date.strftime("%d.%m %Y %H:%M")
+                codes.append({
+                    'code': code,
+                    'type': code_type,
+                    'date': msg_date,
+                    'text': message.text[:100]
+                })
+                
+                if len(codes) >= limit:
+                    break
+            
+            if len(codes) >= limit:
+                break
+        
+        await client.disconnect()
+        logger.info(f"✅ Найдено кодов: {len(codes)}")
+        return codes[:limit]
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения кодов: {e}")
+        return []
+    finally:
+        if client and client.is_connected():
+            await client.disconnect()
+            
+async def create_client_with_proxy(proxy_string=None):
+    """Создаёт клиента с прокси или без"""
+    try:
+        if proxy_string and proxy_list:
+            # Выбираем случайный прокси из списка
+            proxy_string = random.choice(proxy_list)
+            logger.info(f"🔌 Использую прокси: {proxy_string}")
+            
+            # Парсим строку прокси
+            if proxy_string.startswith('socks5://'):
+                # Формат: socks5://user:pass@ip:port
+                import re
+                match = re.match(r'socks5://(?:(.+?):(.+?)@)?(.+?):(\d+)', proxy_string)
+                if match:
+                    user, passw, host, port = match.groups()
+                    if user and passw:
+                        return TelegramClient(
+                            StringSession(), 
+                            API_ID, 
+                            API_HASH,
+                            proxy=(socks5.Socks5Auth(user, passw), host, int(port))
+                        )
+                    else:
+                        return TelegramClient(
+                            StringSession(), 
+                            API_ID, 
+                            API_HASH,
+                            proxy=('socks5', host, int(port))
+                        )
+            elif ':' in proxy_string and not proxy_string.startswith('http'):
+                # Формат: ip:port или ip:port:user:pass
+                parts = proxy_string.split(':')
+                if len(parts) == 2:
+                    # ip:port
+                    return TelegramClient(
+                        StringSession(), 
+                        API_ID, 
+                        API_HASH,
+                        proxy=('socks5', parts[0], int(parts[1]))
+                    )
+                elif len(parts) == 4:
+                    # ip:port:user:pass
+                    return TelegramClient(
+                        StringSession(), 
+                        API_ID, 
+                        API_HASH,
+                        proxy=('socks5', parts[0], int(parts[1]), True, parts[2], parts[3])
+                    )
+        
+        # Если нет прокси, создаём без
+        return TelegramClient(StringSession(), API_ID, API_HASH)
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка создания клиента: {e}")
+        return TelegramClient(StringSession(), API_ID, API_HASH)
+        
 # ==================== ОБРАБОТЧИКИ КОМАНД ====================
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -1138,8 +2159,25 @@ async def referral_system(message: types.Message):
     if await auto_ban_spammer(user_id, message.from_user.username):
         return
     
-    user = get_user(user_id)
+    # ⚠️ ВАЖНО: даже если username нет, передаем хотя бы user_id для создания
+    user = get_user(user_id, message.from_user.username)
     
+    # Если пользователя всё равно нет - создаем принудительно
+    if not user:
+        conn = sqlite3.connect('shop.db')
+        c = conn.cursor()
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        referral_code = generate_referral_code(user_id)
+        
+        c.execute("""INSERT INTO users 
+                     (user_id, username, registered_date, referral_code, first_discount_used)
+                     VALUES (?, ?, ?, ?, ?)""",
+                  (user_id, message.from_user.username or f"user_{user_id}", now, referral_code, 1))
+        conn.commit()
+        conn.close()
+        user = get_user(user_id)
+    
+    # Проверяем реферальный код
     if not user[5]:
         new_code = generate_referral_code(user_id)
         conn = sqlite3.connect('shop.db')
@@ -1159,7 +2197,7 @@ async def referral_system(message: types.Message):
         f"📤 ОТПРАВЛЯЙ ЕЁ ДРУЗЬЯМ И ПОЛУЧАЙ НАГРАДУ!"
     )
     await message.answer(text, reply_markup=referral_keyboard())
-
+    
 @dp.callback_query(F.data == "show_ref_link")
 async def show_ref_link(callback: types.CallbackQuery):
     user_id = callback.from_user.id
@@ -1285,14 +2323,29 @@ async def view_product(callback: types.CallbackQuery):
         await callback.answer()
         return
     
-    product_id, name, price, phone, session, region, year, added = product[:8]
+    # Распаковываем с учетом новых полей
+    if len(product) >= 11:
+        product_id, name, price, phone, session, region, year, added, password, spam_block, register_date = product[:11]
+    else:
+        product_id, name, price, phone, session, region, year, added, password = product[:9]
+        spam_block = 0
+        register_date = None
+    
     age = datetime.now().year - year
     stars_price = int(price / get_setting('stars_rate'))
+    
+    # Форматируем дату регистрации
+    reg_date_text = register_date if register_date else "неизвестно"
+    
+    # Спамблок
+    spam_text = "✅ НЕТ" if spam_block == 0 else "❌ ЕСТЬ"
     
     text = (
         f"📦 <b>{name}</b>\n\n"
         f"🌍 <b>РЕГИОН:</b> {region}\n"
-        f"📅 <b>ГОД СОЗДАНИЯ:</b> {year} ({age} ЛЕТ)\n"
+        f"📅 <b>ГОД РЕГИСТРАЦИИ НА ПРОДАЖУ:</b> {year} ({age} ЛЕТ)\n"
+        f"📆 <b>ДАТА РЕГАККА:</b> {reg_date_text}\n"
+        f"🚫 <b>СПАМБЛОК:</b> {spam_text}\n"
         f"💰 <b>ЦЕНА:</b> <code>{price} ₽</code> / {stars_price} ⭐\n"
         f"🕐 <b>ДОБАВЛЕН:</b> {added[:10]}\n\n"
         f"📱 ТЕЛЕФОН БУДЕТ ДОСТУПЕН ПОСЛЕ ПОКУПКИ."
@@ -1594,6 +2647,210 @@ async def pay_sbp(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(PaymentStates.waiting_for_sbp_amount)
     await callback.answer()
 
+@dp.callback_query(F.data == "admin_download_sessions")
+async def admin_download_sessions(callback: types.CallbackQuery):
+    """Показывает список товаров для скачивания сессий"""
+    products = get_products()
+    
+    if not products:
+        await safe_edit_message(callback.message, "📭 Нет товаров в каталоге.")
+        await callback.answer()
+        return
+    
+    # Фильтруем только те, у которых есть сессия
+    products_with_session = []
+    for p in products:
+        if len(p) >= 5 and p[4]:  # session_string
+            products_with_session.append(p)
+    
+    if not products_with_session:
+        await safe_edit_message(callback.message, "📭 Нет товаров с сохраненными сессиями.")
+        await callback.answer()
+        return
+    
+    # Создаем клавиатуру с товарами
+    buttons = []
+    for prod in products_with_session[:10]:  # показываем первые 10
+        pid, name, price, phone = prod[:4]
+        short_phone = phone[-4:] if phone else "no phone"
+        buttons.append([InlineKeyboardButton(
+            text=f"📦 {name[:20]} | {short_phone} | {price}₽",
+            callback_data=f"download_session_{pid}"
+        )])
+    
+    # Кнопки для массового скачивания
+    buttons.append([
+        InlineKeyboardButton(text="📥 Скачать ВСЕ", callback_data="download_all_sessions")
+    ])
+    buttons.append([
+        InlineKeyboardButton(text="🔙 НАЗАД", callback_data="admin_back")
+    ])
+    
+    await safe_edit_message(
+        callback.message,
+        "📥 <b>ВЫБЕРИ АККАУНТ ДЛЯ СКАЧИВАНИЯ</b>\n\n"
+        f"Всего аккаунтов с сессиями: {len(products_with_session)}",
+        InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+    await callback.answer()
+    
+@dp.callback_query(lambda c: c.data.startswith('download_session_'))
+async def download_single_session(callback: types.CallbackQuery):
+    await callback.answer("🔄 Создаю архив...", show_alert=False)
+    
+    product_id = int(callback.data.split('_')[2])
+    msg = await callback.message.answer("🔄 Создаю архив...")
+    
+    try:
+        zip_data = await create_session_zip([product_id])
+        if not zip_data:
+            await msg.edit_text("❌ Ошибка")
+            return
+        
+        file = io.BytesIO(zip_data)
+        file.name = f"account_{product_id}.zip"
+        
+        await callback.message.answer_document(
+            BufferedInputFile(file.getvalue(), filename=file.name),
+            caption=f"✅ Архив с SQLite .session для аккаунта #{product_id}"
+        )
+        await msg.delete()
+    except Exception as e:
+        await msg.edit_text(f"❌ {e}")
+   
+@dp.callback_query(F.data == "download_all_sessions")
+async def download_all_sessions(callback: types.CallbackQuery):
+    """Скачивает сессии всех аккаунтов"""
+    await callback.message.edit_text("🔄 Создаю архив со всеми сессиями...")
+    
+    # Получаем все товары
+    products = get_products()
+    product_ids = [p[0] for p in products if len(p) >= 5 and p[4]]
+    
+    if not product_ids:
+        await callback.message.edit_text("❌ Нет аккаунтов с сессиями.")
+        await callback.answer()
+        return
+    
+    # Создаем архив
+    zip_data = await create_session_zip(product_ids)
+    
+    if not zip_data:
+        await callback.message.edit_text("❌ Не удалось создать архив.")
+        await callback.answer()
+        return
+    
+    # Отправляем файл
+    import io
+    file = io.BytesIO(zip_data)
+    file.name = f"all_accounts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+    
+    await callback.message.answer_document(
+        types.BufferedInputFile(file.getvalue(), filename=file.name),
+        caption=f"📥 Архив со всеми сессиями ({len(product_ids)} аккаунтов)"
+    )
+    await callback.answer()
+    
+@dp.callback_query(F.data == "admin_delete_by_phone")
+async def admin_delete_by_phone_start(callback: types.CallbackQuery, state: FSMContext):
+    """Начало удаления по номеру телефона"""
+    await safe_edit_message(
+        callback.message,
+        "📱 <b>УДАЛЕНИЕ ТОВАРОВ ПО НОМЕРУ</b>\n\n"
+        "Введи номер телефона (например: +79001234567 или 79001234567):"
+    )
+    await state.set_state(AdminDeleteStates.waiting_for_phone)
+    await callback.answer()
+
+@dp.message(AdminDeleteStates.waiting_for_phone)
+async def admin_delete_by_phone_process(message: types.Message, state: FSMContext):
+    """Обработка введенного номера"""
+    phone_input = message.text.strip()
+    
+    # Очищаем номер для поиска
+    phone_clean = re.sub(r'[^\d+]', '', phone_input)
+    if not phone_clean.startswith('+'):
+        phone_clean = '+' + phone_clean
+    
+    # Ищем товары в базе
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    c.execute("SELECT id, name, price FROM products WHERE phone LIKE ?", (f'%{phone_clean}%',))
+    products = c.fetchall()
+    conn.close()
+    
+    if not products:
+        await message.answer(
+            f"❌ Товары с номером {phone_clean} не найдены.\n\n"
+            f"Попробуй другой номер или отправь /cancel"
+        )
+        return
+    
+    # Сохраняем ID товаров
+    product_ids = [p[0] for p in products]
+    await state.update_data(delete_products=product_ids, delete_phone=phone_clean)
+    
+    # Показываем список для подтверждения
+    text = f"📱 <b>Номер:</b> {phone_clean}\n"
+    text += f"📦 <b>Найдено товаров:</b> {len(products)}\n\n"
+    
+    for i, (pid, name, price) in enumerate(products, 1):
+        text += f"{i}. 🆔 {pid} | {name[:30]} | {price} ₽\n"
+    
+    text += "\n❓ Удалить все эти товары?"
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ ДА, УДАЛИТЬ ВСЕ", callback_data="confirm_delete_by_phone")],
+        [InlineKeyboardButton(text="❌ ОТМЕНА", callback_data="admin_back")]
+    ])
+    
+    await message.answer(text, reply_markup=keyboard)
+    await state.set_state(AdminDeleteStates.waiting_for_confirm)
+
+@dp.callback_query(F.data == "confirm_delete_by_phone")
+async def admin_delete_by_phone_confirm(callback: types.CallbackQuery, state: FSMContext):
+    """Подтверждение удаления"""
+    data = await state.get_data()
+    product_ids = data.get('delete_products', [])
+    phone = data.get('delete_phone', 'неизвестный номер')
+    
+    if not product_ids:
+        await callback.message.edit_text("❌ Ошибка: нет товаров для удаления.")
+        await state.clear()
+        await callback.answer()
+        return
+    
+    # Удаляем товары
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    
+    deleted = 0
+    for pid in product_ids:
+        c.execute("DELETE FROM products WHERE id = ?", (pid,))
+        deleted += c.rowcount
+    
+    conn.commit()
+    conn.close()
+    
+    await callback.message.edit_text(
+        f"✅ <b>ГОТОВО!</b>\n\n"
+        f"📱 Номер: {phone}\n"
+        f"🗑 Удалено товаров: {deleted}"
+    )
+    await state.clear()
+    await callback.answer()
+    
+@dp.message(Command("cancel"))
+async def cancel_operation(message: types.Message, state: FSMContext):
+    """Отмена текущей операции"""
+    current_state = await state.get_state()
+    if current_state is None:
+        await message.answer("❌ Нет активной операции.")
+        return
+    
+    await state.clear()
+    await message.answer("✅ Операция отменена.")
+    
 @dp.message(PaymentStates.waiting_for_sbp_amount)
 async def sbp_amount_handler(message: types.Message, state: FSMContext):
     try:
@@ -1674,6 +2931,164 @@ async def crypto_amount_handler(message: types.Message, state: FSMContext):
     except ValueError:
         await message.answer("❌ ВВЕДИ ЧИСЛО")
 
+@dp.message(F.text == "🔑 ПОЛУЧИТЬ КОДЫ")
+async def get_codes_start(message: types.Message, state: FSMContext):
+    """Начало получения кодов из ZIP файла"""
+    await message.answer(
+        "📁 <b>ОТПРАВЬ ZIP ФАЙЛ С СЕССИЕЙ</b>\n\n"
+        "В ZIP архиве должен быть файл <code>session.session</code>\n"
+        "Пример структуры:\n"
+        "<code>account_123_+79001234567.zip\n"
+        "└── session.session</code>\n\n"
+        "После загрузки бот покажет последние 5 кодов."
+    )
+    await state.set_state(CodeRetrievalStates.waiting_for_zip)
+    
+@dp.message(CodeRetrievalStates.waiting_for_zip, F.document)
+async def process_zip_file(message: types.Message, state: FSMContext):
+    """Обрабатывает загруженный ZIP файл"""
+    document = message.document
+    
+    # Проверяем расширение
+    if not document.file_name.endswith('.zip'):
+        await message.answer("❌ Неверный формат. Отправь ZIP архив.")
+        return
+    
+    # Скачиваем файл
+    file_info = await bot.get_file(document.file_id)
+    file_bytes = await bot.download_file(file_info.file_path)
+    
+    try:
+        # Распаковываем ZIP
+        import zipfile
+        import io
+        
+        zip_buffer = io.BytesIO(file_bytes)
+        with zipfile.ZipFile(zip_buffer, 'r') as zip_file:
+            # Ищем .session файл
+            session_file = None
+            session_string = None
+            
+            for filename in zip_file.namelist():
+                if filename.endswith('.session'):
+                    session_file = filename
+                    # Читаем содержимое
+                    with zip_file.open(session_file) as f:
+                        session_string = f.read().decode('utf-8')
+                    break
+            
+            if not session_string:
+                await message.answer("❌ В ZIP архиве не найден файл <code>session.session</code>")
+                await state.clear()
+                return
+            
+            # Сохраняем сессию в state
+            await state.update_data(session_string=session_string)
+            
+            # Ищем INFO.json (опционально)
+            if 'info.json' in zip_file.namelist():
+                with zip_file.open('info.json') as f:
+                    info = json.loads(f.read().decode('utf-8'))
+                    await state.update_data(account_info=info)
+            
+            # Показываем загрузку
+            status_msg = await message.answer("🔄 ПОДКЛЮЧАЮСЬ К АККАУНТУ...")
+            
+            # Получаем коды
+            codes = await get_codes_from_session(session_string, limit=5)
+            
+            if not codes:
+                await status_msg.edit_text(
+                    "❌ <b>НЕ УДАЛОСЬ ПОЛУЧИТЬ КОДЫ</b>\n\n"
+                    "Причины:\n"
+                    "• Сессия недействительна\n"
+                    "• Аккаунт не авторизован\n"
+                    "• В аккаунте нет кодов"
+                )
+                await state.clear()
+                return
+            
+            # Сохраняем коды в state для обновления
+            await state.update_data(codes=codes, last_codes=codes)
+            
+            # Формируем сообщение
+            text = "📨 <b>ПОСЛЕДНИЕ КОДЫ</b>\n\n"
+            for i, code_data in enumerate(codes, 1):
+                star = "⭐ " if i == 1 else ""
+                text += f"{i}. {star}{code_data['type']} <code>{code_data['code']}</code>\n"
+                text += f"   🕐 {code_data['date']}\n"
+                if code_data.get('text'):
+                    text += f"   💬 {code_data['text'][:50]}...\n"
+                text += "\n"
+            
+            # Добавляем клавиатуру
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 ОБНОВИТЬ КОДЫ", callback_data="refresh_codes")],
+                [InlineKeyboardButton(text="🔙 В МЕНЮ", callback_data="back_to_main")]
+            ])
+            
+            await status_msg.edit_text(text, reply_markup=keyboard)
+            await state.set_state(CodeRetrievalStates.waiting_for_action)
+            
+    except zipfile.BadZipFile:
+        await message.answer("❌ Неверный ZIP архив.")
+        await state.clear()
+    except Exception as e:
+        logger.error(f"Ошибка обработки ZIP: {e}")
+        await message.answer(f"❌ Ошибка: {str(e)[:200]}")
+        await state.clear()
+        
+@dp.callback_query(F.data == "refresh_codes", CodeRetrievalStates.waiting_for_action)
+async def refresh_codes(callback: types.CallbackQuery, state: FSMContext):
+    """Обновляет список кодов"""
+    data = await state.get_data()
+    session_string = data.get('session_string')
+    
+    if not session_string:
+        await callback.message.edit_text("❌ Сессия не найдена. Загрузи ZIP заново.")
+        await state.clear()
+        await callback.answer()
+        return
+    
+    await callback.message.edit_text("🔄 ОБНОВЛЯЮ КОДЫ...")
+    
+    codes = await get_codes_from_session(session_string, limit=5)
+    
+    if not codes:
+        await callback.message.edit_text(
+            "❌ <b>НЕТ НОВЫХ КОДОВ</b>\n\n"
+            "Попробуй позже или проверь аккаунт."
+        )
+        await callback.answer()
+        return
+    
+    # Сохраняем обновленные коды
+    await state.update_data(codes=codes, last_codes=codes)
+    
+    # Формируем сообщение
+    text = "📨 <b>ОБНОВЛЕННЫЕ КОДЫ</b>\n\n"
+    for i, code_data in enumerate(codes, 1):
+        star = "⭐ " if i == 1 else ""
+        text += f"{i}. {star}{code_data['type']} <code>{code_data['code']}</code>\n"
+        text += f"   🕐 {code_data['date']}\n"
+        if code_data.get('text'):
+            text += f"   💬 {code_data['text'][:50]}...\n"
+        text += "\n"
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 ОБНОВИТЬ", callback_data="refresh_codes")],
+        [InlineKeyboardButton(text="🔙 В МЕНЮ", callback_data="back_to_main")]
+    ])
+    
+    await callback.message.edit_text(text, reply_markup=keyboard)
+    await callback.answer()
+    
+@dp.callback_query(F.data == "back_to_main")
+async def back_to_main_from_codes(callback: types.CallbackQuery, state: FSMContext):
+    """Возврат в главное меню"""
+    await state.clear()
+    await cmd_start(callback.message)
+    await callback.answer()
 # ==================== АДМИНСКИЕ ОБРАБОТЧИКИ ПЛАТЕЖЕЙ ====================
 @dp.callback_query(lambda c: c.data.startswith('send_details_'))
 async def send_payment_details(callback: types.CallbackQuery, state: FSMContext):
@@ -1902,33 +3317,54 @@ async def product_code_handler(message: types.Message, state: FSMContext):
     
     data = await state.get_data()
     phone = data.get('phone')
-    logger.info(f"🔍 DEBUG: Телефон из state: {phone}")
     
-    if phone in temp_clients:
-        logger.info(f"✅ Клиент найден в temp_clients")
-    else:
+    if not phone:
+        await message.answer("❌ Ошибка: номер не найден")
+        await state.clear()
+        return
+    
+    if phone not in temp_clients:
         logger.error(f"❌ Клиент НЕ найден в temp_clients!")
-        logger.info(f"🔍 Доступные ключи: {list(temp_clients.keys())}")
+        await message.answer("❌ Сессия истекла. Начни заново.")
+        await state.clear()
+        return
     
     status_msg = await message.answer("🔄 ПРОВЕРЯЮ КОД...")
     result = await verify_code(phone, code)
     
     if not result['success']:
-        await status_msg.edit_text(f"❌ ОШИБКА: {result.get('error', 'НЕИЗВЕСТНАЯ')}")
-        await state.clear()
+        error_text = result.get('error', 'НЕИЗВЕСТНАЯ ОШИБКА')
+        await status_msg.edit_text(f"❌ {error_text}")
+        
+        # Если код неверный, предлагаем попробовать снова
+        if "Неверный код" in error_text:
+            await message.answer(
+                "❌ Неверный код. Попробуй еще раз:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔄 Отправить код заново", callback_data="resend_code")]
+                ])
+            )
+        else:
+            await state.clear()
         return
     
     if result.get('need_password'):
         logger.info("🔐 Требуется 2FA пароль")
         await state.update_data(phone=phone)
         await status_msg.edit_text(
-            "🔐 <b>ТРЕБУЕТСЯ 2FA ПАРОЛЬ (ОБЛАЧНЫЙ ПАРОЛЬ)</b>\n\n"
+            "🔐 <b>ТРЕБУЕТСЯ 2FA ПАРОЛЬ</b>\n\n"
             "ВВЕДИ ПАРОЛЬ:"
         )
         await state.set_state(ProductStates.waiting_for_password)
     else:
-        logger.info("✅ Успешный вход без 2FA")
+        logger.info("✅ Успешный вход")
+        
         data = await state.get_data()
+        account_info = result.get('account_info', {})
+        register_date = account_info.get('register_date')
+        spam_block = account_info.get('spam_block', 0)
+        account_age = account_info.get('account_age_days', 0)
+        
         pid = add_product(
             data['name'],
             data['price'],
@@ -1936,20 +3372,71 @@ async def product_code_handler(message: types.Message, state: FSMContext):
             result['session'],
             result['region'],
             result['year'],
-            data.get('account_password')
+            data.get('account_password'),
+            spam_block,
+            register_date,
+            account_age
         )
-        logger.info(f"✅ Товар добавлен с ID: {pid}")
+        
+        reg_date_text = register_date if register_date else "неизвестно"
+        spam_text = "✅ НЕТ" if spam_block == 0 else "❌ ЕСТЬ"
+        
         await status_msg.edit_text(
             f"✅ <b>АККАУНТ УСПЕШНО ДОБАВЛЕН!</b>\n\n"
             f"📦 НАЗВАНИЕ: <b>{data['name']}</b>\n"
             f"💰 ЦЕНА: <code>{data['price']} ₽</code>\n"
             f"🌍 РЕГИОН: {result['region']}\n"
-            f"📅 ГОД: {result['year']}\n"
+            f"📅 ГОД ВЫСТАВЛЕНИЕ НА ПРОДАЖУ: {result['year']}\n"
+            f"📆 ДАТА РЕГА АККА: <b>{reg_date_text}</b>\n"
+            f"🚫 СПАМБЛОК: <b>{spam_text}</b>\n"
             f"🔑 ПАРОЛЬ: <code>{data.get('account_password', 'НЕТ')}</code>\n"
             f"🆔 ID: <code>{pid}</code>"
         )
         await state.clear()
 
+@dp.callback_query(F.data == "resend_code")
+async def resend_code_handler(callback: types.CallbackQuery, state: FSMContext):
+    """Повторная отправка кода"""
+    data = await state.get_data()
+    phone = data.get('phone')
+    
+    if not phone:
+        await callback.message.edit_text("❌ Ошибка: номер не найден")
+        await callback.answer()
+        return
+    
+    client_data = temp_clients.get(phone)
+    if not client_data:
+        await callback.message.edit_text("❌ Сессия истекла, начни заново")
+        await callback.answer()
+        await state.clear()
+        return
+    
+    client = client_data.get('client')
+    
+    try:
+        await callback.message.edit_text("🔄 Отправляю код заново...")
+        
+        # Отправляем код заново
+        result = await client.send_code_request(phone)
+        
+        # Обновляем хеш
+        temp_clients[phone] = {
+            'client': client,
+            'phone_code_hash': result.phone_code_hash
+        }
+        
+        await callback.message.edit_text(
+            f"📱 <b>НОВЫЙ КОД ОТПРАВЛЕН!</b>\n\n"
+            f"Проверь виртуальный номер в течение 1-2 минут.\n"
+            f"Код обычно приходит SMS-сообщением.\n\n"
+            f"✍️ ВВЕДИ КОД:"
+        )
+    except Exception as e:
+        await callback.message.edit_text(f"❌ Ошибка: {e}")
+    
+    await callback.answer()
+    
 @dp.message(ProductStates.waiting_for_password)
 async def product_password_handler(message: types.Message, state: FSMContext):
     password = message.text.strip()
@@ -1963,7 +3450,15 @@ async def product_password_handler(message: types.Message, state: FSMContext):
         await status_msg.edit_text(f"❌ ОШИБКА: {result.get('error', 'НЕВЕРНЫЙ ПАРОЛЬ')}")
         return
     
+    # Получаем данные из state
     data = await state.get_data()
+    
+    # 🔥🔥🔥 ПОЛУЧАЕМ ИНФОРМАЦИЮ ОБ АККАУНТЕ 🔥🔥🔥
+    account_info = result.get('account_info', {})
+    register_date = account_info.get('register_date')
+    spam_block = account_info.get('spam_block', 0)
+    
+    # Добавляем товар в базу
     pid = add_product(
         data['name'],
         data['price'],
@@ -1971,14 +3466,27 @@ async def product_password_handler(message: types.Message, state: FSMContext):
         result['session'],
         result['region'],
         result['year'],
-        data.get('account_password')
+        data.get('account_password'),
+        spam_block,        # ← АВТОМАТИЧЕСКИ
+        register_date      # ← АВТОМАТИЧЕСКИ
     )
+    
+    logger.info(f"✅ Товар добавлен с ID: {pid}")
+    logger.info(f"📅 Дата регистрации: {register_date}")
+    logger.info(f"🚫 Спамблок: {'ЕСТЬ' if spam_block else 'НЕТ'}")
+    
+    # Формируем сообщение
+    reg_date_text = register_date if register_date else "неизвестно"
+    spam_text = "✅ НЕТ" if spam_block == 0 else "❌ ЕСТЬ"
+    
     await status_msg.edit_text(
         f"✅ <b>АККАУНТ УСПЕШНО ДОБАВЛЕН!</b>\n\n"
         f"📦 НАЗВАНИЕ: <b>{data['name']}</b>\n"
         f"💰 ЦЕНА: <code>{data['price']} ₽</code>\n"
         f"🌍 РЕГИОН: {result['region']}\n"
         f"📅 ГОД: {result['year']}\n"
+        f"📆 ДАТА РЕГА: <b>{reg_date_text}</b>\n"
+        f"🚫 СПАМБЛОК: <b>{spam_text}</b>\n"
         f"🔑 ПАРОЛЬ: <code>{data.get('account_password', 'НЕТ')}</code>\n"
         f"🆔 ID: <code>{pid}</code>"
     )
