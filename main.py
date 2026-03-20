@@ -1669,8 +1669,10 @@ async def create_session_zip(product_ids: List[int]) -> Optional[bytes]:
                     )
                     await client.connect()
                     
-   if not await client.is_user_authorized():
-    raise Exception("Сессия не авторизована")
+                    # ⚠️⚠️⚠️ ИСПРАВЛЕННЫЙ ОТСТУП ⚠️⚠️⚠️
+                    if not await client.is_user_authorized():
+                        raise Exception("Сессия не авторизована")
+                    
                     # 🔥 обязательно "активируем" сессию
                     await client.get_me()
 
@@ -1685,10 +1687,9 @@ async def create_session_zip(product_ids: List[int]) -> Optional[bytes]:
                         client.session.port
                     )
 
-# 🔥 ВОТ ЭТО ТЫ ПРОПУСТИЛ
                     await file_client.session.save()
-
                     await file_client.disconnect()
+                    await client.disconnect()
 
                     # === 4. читаем файл ===
                     session_file = session_path + ".session"
