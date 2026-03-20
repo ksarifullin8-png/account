@@ -1893,13 +1893,19 @@ async def get_codes_from_session(session_string: str, limit: int = 5) -> List[Di
         logger.info("✅ Подключен к аккаунту, ищу коды...")
         
         # Ищем сообщения с кодами
-        async for message in client.iter_messages(None, limit=100):
+        async for message in client.iter_messages(None, limit=200):
             if not message.text:
                 continue
             
+            text_lower = message.text.lower()
             found_codes = re.findall(r'\b(\d{4,8})\b', message.text)
+            
             for code in found_codes:
-                text_lower = message.text.lower()
+                # Пропускаем слишком длинные числа (номера телефонов)
+                if len(code) > 6:
+                    continue
+                    
+                # Определяем тип кода
                 if any(word in text_lower for word in ['2fa', 'пароль', 'password']):
                     code_type = "🔒 2FA"
                 elif any(word in text_lower for word in ['code', 'код', 'login', 'вход']):
@@ -1907,7 +1913,7 @@ async def get_codes_from_session(session_string: str, limit: int = 5) -> List[Di
                 else:
                     continue
                 
-                msg_date = message.date.strftime("%d.%m %Y %H:%M")
+                msg_date = message.date.strftime("%d.%m.%Y %H:%M")
                 codes.append({
                     'code': code,
                     'type': code_type,
@@ -2954,31 +2960,51 @@ async def process_zip_file(message: types.Message, state: FSMContext):
         await message.answer("❌ Неверный формат. Отправь ZIP архив.")
         return
     
-    # Скачиваем файл
-    file_info = await bot.get_file(document.file_id)
-    file_bytes = await bot.download_file(file_info.file_path)
+    # Отправляем сообщение о загрузке
+    status_msg = await message.answer("📥 СКАЧИВАЮ ФАЙЛ...")
     
     try:
+        # Скачиваем файл в байты
+        file_info = await bot.get_file(document.file_id)
+        file_bytes = await bot.download_file(file_info.file_path)
+        
+        # Проверяем, что скачалось
+        if not file_bytes:
+            await status_msg.edit_text("❌ Не удалось скачать файл.")
+            await state.clear()
+            return
+        
+        await status_msg.edit_text("📦 РАСПАКОВЫВАЮ АРХИВ...")
+        
         # Распаковываем ZIP
         import zipfile
         import io
         
+        # Создаем BytesIO объект из байтов
         zip_buffer = io.BytesIO(file_bytes)
+        
         with zipfile.ZipFile(zip_buffer, 'r') as zip_file:
             # Ищем .session файл
             session_file = None
             session_string = None
             
-            for filename in zip_file.namelist():
+            # Выводим список файлов в архиве для отладки
+            file_list = zip_file.namelist()
+            logger.info(f"Файлы в архиве: {file_list}")
+            
+            for filename in file_list:
                 if filename.endswith('.session'):
                     session_file = filename
-                    # Читаем содержимое
+                    # Читаем содержимое как текст
                     with zip_file.open(session_file) as f:
                         session_string = f.read().decode('utf-8')
                     break
             
             if not session_string:
-                await message.answer("❌ В ZIP архиве не найден файл <code>session.session</code>")
+                await status_msg.edit_text(
+                    "❌ В ZIP архиве не найден файл <code>session.session</code>\n\n"
+                    f"Найдены файлы: {', '.join(file_list)}"
+                )
                 await state.clear()
                 return
             
@@ -2986,13 +3012,12 @@ async def process_zip_file(message: types.Message, state: FSMContext):
             await state.update_data(session_string=session_string)
             
             # Ищем INFO.json (опционально)
-            if 'info.json' in zip_file.namelist():
+            if 'info.json' in file_list:
                 with zip_file.open('info.json') as f:
                     info = json.loads(f.read().decode('utf-8'))
                     await state.update_data(account_info=info)
             
-            # Показываем загрузку
-            status_msg = await message.answer("🔄 ПОДКЛЮЧАЮСЬ К АККАУНТУ...")
+            await status_msg.edit_text("🔄 ПОДКЛЮЧАЮСЬ К АККАУНТУ...")
             
             # Получаем коды
             codes = await get_codes_from_session(session_string, limit=5)
@@ -3009,7 +3034,7 @@ async def process_zip_file(message: types.Message, state: FSMContext):
                 return
             
             # Сохраняем коды в state для обновления
-            await state.update_data(codes=codes, last_codes=codes)
+            await state.update_data(codes=codes, last_codes=codes, session_string=session_string)
             
             # Формируем сообщение
             text = "📨 <b>ПОСЛЕДНИЕ КОДЫ</b>\n\n"
@@ -3027,15 +3052,18 @@ async def process_zip_file(message: types.Message, state: FSMContext):
                 [InlineKeyboardButton(text="🔙 В МЕНЮ", callback_data="back_to_main")]
             ])
             
-            await status_msg.edit_text(text, reply_markup=keyboard)
+            await status_msg.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
             await state.set_state(CodeRetrievalStates.waiting_for_action)
             
     except zipfile.BadZipFile:
-        await message.answer("❌ Неверный ZIP архив.")
+        await status_msg.edit_text("❌ Неверный ZIP архив. Файл поврежден.")
+        await state.clear()
+    except UnicodeDecodeError:
+        await status_msg.edit_text("❌ Ошибка чтения файла session.session. Возможно, файл поврежден.")
         await state.clear()
     except Exception as e:
         logger.error(f"Ошибка обработки ZIP: {e}")
-        await message.answer(f"❌ Ошибка: {str(e)[:200]}")
+        await status_msg.edit_text(f"❌ Ошибка: {str(e)[:200]}")
         await state.clear()
         
 @dp.callback_query(F.data == "refresh_codes", CodeRetrievalStates.waiting_for_action)
