@@ -2870,6 +2870,39 @@ async def pay_sbp(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(PaymentStates.waiting_for_sbp_amount)
     await callback.answer()
 
+@dp.callback_query(F.data == "download_all_sessions")
+async def download_all_sessions(callback: types.CallbackQuery):
+    """Скачивает сессии всех аккаунтов"""
+    await callback.message.edit_text("🔄 Создаю архив со всеми сессиями...")
+    
+    # Получаем все товары
+    products = get_products()
+    product_ids = [p[0] for p in products if len(p) >= 5 and p[4]]
+    
+    if not product_ids:
+        await callback.message.edit_text("❌ Нет аккаунтов с сессиями.")
+        await callback.answer()
+        return
+    
+    # Создаем архив
+    zip_data = await create_session_zip(product_ids)
+    
+    if not zip_data:
+        await callback.message.edit_text("❌ Не удалось создать архив.")
+        await callback.answer()
+        return
+    
+    # Отправляем файл
+    import io
+    file = io.BytesIO(zip_data)
+    file.name = f"all_accounts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+    
+await callback.message.answer_document(
+    BufferedInputFile(file.getvalue(), filename=file.name),
+    caption=f"📥 Архив со всеми сессиями ({len(product_ids)} аккаунтов)"
+)
+    await callback.answer()
+    
 @dp.callback_query(F.data == "admin_download_sessions")
 async def admin_download_sessions(callback: types.CallbackQuery):
     """Показывает список товаров для скачивания сессий"""
@@ -2940,13 +2973,7 @@ async def download_single_session(callback: types.CallbackQuery):
         await msg.delete()
     except Exception as e:
         await msg.edit_text(f"❌ {e}")
-   
-await callback.message.answer_document(
-    BufferedInputFile(file.getvalue(), filename=file.name),
-    caption=f"📥 Архив со всеми сессиями ({len(product_ids)} аккаунтов)"
-)
-    await callback.answer()
-    
+  
 @dp.callback_query(F.data == "admin_delete_by_phone")
 async def admin_delete_by_phone_start(callback: types.CallbackQuery, state: FSMContext):
     """Начало удаления по номеру телефона"""
