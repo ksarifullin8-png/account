@@ -14,7 +14,6 @@ import io
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple, Callable, Awaitable
 import tempfile
-import socks5
 
 from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.filters import Command
@@ -2058,8 +2057,8 @@ async def get_codes_from_session(session_string: str, limit: int = 5) -> List[Di
 async def create_client_with_proxy(proxy_string=None):
     """Создаёт клиента с прокси или без"""
     try:
-        if proxy_string and proxy_list:
-            # Выбираем случайный прокси из списка
+        # Если есть список прокси, выбираем случайный
+        if proxy_list:
             proxy_string = random.choice(proxy_list)
             logger.info(f"🔌 Использую прокси: {proxy_string}")
             
@@ -2897,10 +2896,10 @@ async def download_all_sessions(callback: types.CallbackQuery):
     file = io.BytesIO(zip_data)
     file.name = f"all_accounts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
     
-await callback.message.answer_document(
-    BufferedInputFile(file.getvalue(), filename=file.name),
-    caption=f"📥 Архив со всеми сессиями ({len(product_ids)} аккаунтов)"
-)
+    await callback.message.answer_document(
+        BufferedInputFile(file.getvalue(), filename=file.name),
+        caption=f"📥 Архив со всеми сессиями ({len(product_ids)} аккаунтов)"
+    )
     await callback.answer()
     
 @dp.callback_query(F.data == "admin_download_sessions")
