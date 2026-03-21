@@ -4225,3 +4225,7 @@ async def main():
         traceback.print_exc()
     finally:
         await bot.session.close()
+        
+        # ==================== ЗАПУСК ====================
+if __name__ == '__main__':
+    asyncio.run(main())
