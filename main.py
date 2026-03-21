@@ -121,7 +121,10 @@ class AdminPaymentStates(StatesGroup):
 class AdminAddBalanceStates(StatesGroup):
     waiting_for_user_id = State()
     waiting_for_amount = State()
-
+    
+class AdminSessionCheckStates(StatesGroup):
+    waiting_for_confirm = State()
+    
 class AdminDeleteStates(StatesGroup):
     waiting_for_phone = State()
     waiting_for_confirm = State()
@@ -1563,6 +1566,148 @@ async def verify_password(phone: str, password: str) -> Dict[str, Any]:
         traceback.print_exc()
         return {'success': False, 'error': str(e)}
 
+async def check_session_valid(session_string: str) -> Dict[str, Any]:
+    """
+    Проверяет работоспособность сессии.
+    Возвращает словарь с результатом проверки.
+    """
+    client = None
+    try:
+        client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+        await client.connect()
+        
+        if not await client.is_user_authorized():
+            return {
+                'valid': False,
+                'error': '❌ Сессия не авторизована'
+            }
+        
+        me = await client.get_me()
+        
+        # Проверяем возможность отправки сообщения (не спам-блок)
+        try:
+            from telethon.tl.functions.messages import SendMessageRequest
+            await client(SendMessageRequest(
+                peer=await client.get_input_entity(me.id),
+                message="test",
+                random_id=random.randint(0, 2**63)
+            ))
+            spam_block = False
+        except Exception as e:
+            spam_block = True if 'FLOOD_WAIT' in str(e) or 'RESTRICTED' in str(e) else False
+        
+        await client.disconnect()
+        
+        return {
+            'valid': True,
+            'phone': me.phone,
+            'username': me.username,
+            'first_name': me.first_name,
+            'spam_block': spam_block
+        }
+        
+    except Exception as e:
+        return {
+            'valid': False,
+            'error': str(e)
+        }
+    finally:
+        if client and client.is_connected():
+            await client.disconnect()
+          
+async def check_all_sessions() -> Dict[str, Any]:
+    """
+    Проверяет все сессии в таблице products.
+    Возвращает статистику.
+    """
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    c.execute("SELECT id, name, phone, session_string FROM products WHERE session_string IS NOT NULL AND session_string != ''")
+    products = c.fetchall()
+    conn.close()
+    
+    if not products:
+        return {'total': 0, 'valid': 0, 'invalid': 0, 'details': []}
+    
+    valid_count = 0
+    invalid_count = 0
+    details = []
+    
+    for pid, name, phone, session_string in products:
+        result = await check_session_valid(session_string)
+        
+        if result['valid']:
+            valid_count += 1
+            status = '✅'
+            info = f"{phone} | {name[:20]}"
+        else:
+            invalid_count += 1
+            status = '❌'
+            info = f"{phone} | {name[:20]} | Ошибка: {result.get('error', 'Неизвестно')[:50]}"
+        
+        details.append({
+            'id': pid,
+            'name': name,
+            'phone': phone,
+            'valid': result['valid'],
+            'status': status,
+            'info': info,
+            'error': result.get('error') if not result['valid'] else None,
+            'spam_block': result.get('spam_block', False) if result['valid'] else None
+        })
+        
+        # Небольшая задержка, чтобы не перегружать API
+        await asyncio.sleep(1)
+    
+    return {
+        'total': len(products),
+        'valid': valid_count,
+        'invalid': invalid_count,
+        'details': details
+    } 
+    
+async def auto_check_sessions():
+    """Автоматическая проверка сессий каждые 24 часа"""
+    while True:
+        try:
+            logger.info("🔄 Запуск автоматической проверки сессий...")
+            
+            result = await check_all_sessions()
+            
+            # Отправляем отчёт админам
+            text = (
+                f"📊 <b>АВТОМАТИЧЕСКАЯ ПРОВЕРКА СЕССИЙ</b>\n\n"
+                f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n"
+                f"👥 Всего аккаунтов: <b>{result['total']}</b>\n"
+                f"✅ Рабочих: <b>{result['valid']}</b>\n"
+                f"❌ Невалидных: <b>{result['invalid']}</b>\n\n"
+            )
+            
+            if result['invalid'] > 0:
+                text += "🚨 <b>ПРОБЛЕМНЫЕ АККАУНТЫ:</b>\n\n"
+                for detail in result['details']:
+                    if not detail['valid']:
+                        text += f"🆔 {detail['id']} | 📱 {detail['phone']}\n"
+                        text += f"❌ {detail['error'][:100]}\n\n"
+                        
+                        if len(text) > 3500:
+                            break
+            
+            text += f"\n🔄 Следующая проверка через 24 часа"
+            
+            for admin_id in ADMIN_IDS:
+                try:
+                    await bot.send_message(admin_id, text)
+                except:
+                    pass
+            
+            logger.info(f"✅ Автопроверка завершена: {result['valid']}/{result['total']} рабочих")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка автопроверки: {e}")
+        
+        # Ждём 24 часа
+        await asyncio.sleep(24 * 60 * 60)
 # ==================== КРИПТО ФУНКЦИИ ====================
 async def fetch_usdt_rate() -> float:
     try:
@@ -1703,6 +1848,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📱 УДАЛИТЬ ПО НОМЕРУ", callback_data="admin_delete_by_phone")],
         [InlineKeyboardButton(text="📦 СПИСОК ТОВАРОВ", callback_data="admin_list_products")],
         [InlineKeyboardButton(text="📥 СКАЧАТЬ СЕССИИ", callback_data="admin_download_sessions")],
+        [InlineKeyboardButton(text="🔍 ПРОВЕРИТЬ СЕССИИ", callback_data="admin_check_sessions")],  # ← НОВАЯ КНОПКА
         [InlineKeyboardButton(text="📊 СТАТИСТИКА", callback_data="admin_stats")],
         [InlineKeyboardButton(text="💰 НАЧИСЛИТЬ БАЛАНС", callback_data="admin_add_balance")],
         [InlineKeyboardButton(text="📢 РАССЫЛКА", callback_data="admin_mailing")],
@@ -2490,6 +2636,127 @@ async def show_codes(callback: types.CallbackQuery):
     
     await callback.answer()
 
+@dp.callback_query(F.data == "admin_check_sessions")
+async def admin_check_sessions_start(callback: types.CallbackQuery, state: FSMContext):
+    """Начало ручной проверки сессий"""
+    await safe_edit_message(
+        callback.message,
+        "🔍 <b>ПРОВЕРКА СЕССИЙ</b>\n\n"
+        "Выбери действие:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔍 ПРОВЕРИТЬ ВСЕ СЕССИИ", callback_data="check_all_sessions")],
+            [InlineKeyboardButton(text="🔙 НАЗАД", callback_data="admin_back")]
+        ])
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "check_all_sessions")
+async def admin_check_all_sessions(callback: types.CallbackQuery):
+    """Ручная проверка всех сессий"""
+    await callback.message.edit_text("🔄 НАЧИНАЮ ПРОВЕРКУ ВСЕХ СЕССИЙ...\n\nЭто может занять несколько минут...")
+    await callback.answer()
+    
+    try:
+        result = await check_all_sessions()
+        
+        text = (
+            f"📊 <b>РЕЗУЛЬТАТ ПРОВЕРКИ СЕССИЙ</b>\n\n"
+            f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n"
+            f"👥 Всего аккаунтов: <b>{result['total']}</b>\n"
+            f"✅ Рабочих: <b>{result['valid']}</b>\n"
+            f"❌ Невалидных: <b>{result['invalid']}</b>\n\n"
+        )
+        
+        if result['details']:
+            text += "📋 <b>ДЕТАЛИ:</b>\n\n"
+            for detail in result['details'][:20]:  # Показываем первые 20
+                if detail['valid']:
+                    text += f"{detail['status']} 🆔 {detail['id']} | 📱 {detail['phone']}\n"
+                    if detail.get('spam_block'):
+                        text += f"   ⚠️ ВНИМАНИЕ: Аккаунт в спам-блоке!\n"
+                else:
+                    text += f"{detail['status']} 🆔 {detail['id']} | 📱 {detail['phone']}\n"
+                    text += f"   ❌ {detail['error'][:80]}\n"
+                text += "\n"
+            
+            if len(result['details']) > 20:
+                text += f"... и ещё {len(result['details']) - 20} аккаунтов\n"
+        
+        # Добавляем кнопку для удаления невалидных
+        if result['invalid'] > 0:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🗑 УДАЛИТЬ НЕВАЛИДНЫЕ", callback_data="delete_invalid_sessions")],
+                [InlineKeyboardButton(text="🔙 НАЗАД", callback_data="admin_back")]
+            ])
+        else:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 НАЗАД", callback_data="admin_back")]
+            ])
+        
+        await callback.message.edit_text(text, reply_markup=keyboard)
+        
+    except Exception as e:
+        await callback.message.edit_text(f"❌ Ошибка проверки: {e}")
+        logger.error(f"Ошибка проверки сессий: {e}")
+
+@dp.callback_query(F.data == "delete_invalid_sessions")
+async def delete_invalid_sessions(callback: types.CallbackQuery, state: FSMContext):
+    """Подтверждение удаления невалидных сессий"""
+    await safe_edit_message(
+        callback.message,
+        "⚠️ <b>ВНИМАНИЕ!</b>\n\n"
+        "Ты собираешься удалить все аккаунты с нерабочими сессиями.\n"
+        "Это действие необратимо!\n\n"
+        "❓ Подтверди удаление:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ ДА, УДАЛИТЬ", callback_data="confirm_delete_invalid")],
+            [InlineKeyboardButton(text="❌ ОТМЕНА", callback_data="admin_back")]
+        ])
+    )
+    await callback.answer()
+    await state.set_state(AdminSessionCheckStates.waiting_for_confirm)
+
+@dp.callback_query(F.data == "confirm_delete_invalid")
+async def confirm_delete_invalid(callback: types.CallbackQuery, state: FSMContext):
+    """Удаление невалидных сессий"""
+    await callback.message.edit_text("🔄 ПРОВЕРЯЮ И УДАЛЯЮ НЕВАЛИДНЫЕ СЕССИИ...")
+    await callback.answer()
+    
+    try:
+        # Проверяем все сессии
+        result = await check_all_sessions()
+        
+        if result['invalid'] == 0:
+            await callback.message.edit_text("✅ Нет невалидных сессий для удаления.")
+            await state.clear()
+            return
+        
+        # Собираем ID невалидных
+        invalid_ids = [detail['id'] for detail in result['details'] if not detail['valid']]
+        
+        # Удаляем
+        conn = sqlite3.connect('shop.db')
+        c = conn.cursor()
+        
+        deleted = 0
+        for pid in invalid_ids:
+            c.execute("DELETE FROM products WHERE id = ?", (pid,))
+            deleted += c.rowcount
+        
+        conn.commit()
+        conn.close()
+        
+        await callback.message.edit_text(
+            f"✅ <b>УДАЛЕНИЕ ЗАВЕРШЕНО!</b>\n\n"
+            f"🗑 Удалено аккаунтов: <b>{deleted}</b>\n"
+            f"📊 Всего аккаунтов в каталоге: <b>{len(get_products())}</b>"
+        )
+        await state.clear()
+        
+    except Exception as e:
+        await callback.message.edit_text(f"❌ Ошибка: {e}")
+        await state.clear()
+        
 @dp.callback_query(lambda c: c.data.startswith('session_file_'))
 async def session_file(callback: types.CallbackQuery):
     log_user_action(callback.from_user.id, "session_file")
@@ -3967,6 +4234,10 @@ async def main():
         logger.info("✅ Все системы работают")
         logger.info(f"👥 Администраторы: {ADMIN_IDS}")
         
+        # 🔥 ЗАПУСКАЕМ ФОНОВУЮ ПРОВЕРКУ СЕССИЙ
+        asyncio.create_task(auto_check_sessions())
+        logger.info("🔄 Запущена фоновая проверка сессий (каждые 24 часа)")
+        
         await dp.start_polling(bot, skip_updates=True)
         
     except Exception as e:
@@ -3974,12 +4245,3 @@ async def main():
         traceback.print_exc()
     finally:
         await bot.session.close()
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("👋 Бот остановлен пользователем")
-    except Exception as e:
-        logger.error(f"❌ Ошибка: {e}")
-        traceback.print_exc()
