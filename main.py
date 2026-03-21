@@ -14,6 +14,7 @@ import io
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple, Callable, Awaitable
 import tempfile
+import socks5
 
 from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.filters import Command
@@ -24,8 +25,9 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton,
     LabeledPrice, PreCheckoutQuery, FSInputFile,
-    BufferedInputFile  # ← ДОБАВЬ ЭТОТ ИМПОРТ
 )
+# Добавь это ОТДЕЛЬНО:
+from aiogram.types import BufferedInputFile
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
@@ -2062,28 +2064,7 @@ async def create_client_with_proxy(proxy_string=None):
             logger.info(f"🔌 Использую прокси: {proxy_string}")
             
             # Парсим строку прокси
-            if proxy_string.startswith('socks5://'):
-                # Формат: socks5://user:pass@ip:port
-                import re
-                match = re.match(r'socks5://(?:(.+?):(.+?)@)?(.+?):(\d+)', proxy_string)
-                if match:
-                    user, passw, host, port = match.groups()
-                    if user and passw:
-                        return TelegramClient(
-                            StringSession(), 
-                            API_ID, 
-                            API_HASH,
-                            proxy=(socks5.Socks5Auth(user, passw), host, int(port))
-                        )
-                    else:
-                        return TelegramClient(
-                            StringSession(), 
-                            API_ID, 
-                            API_HASH,
-                            proxy=('socks5', host, int(port))
-                        )
-            elif ':' in proxy_string and not proxy_string.startswith('http'):
-                # Формат: ip:port или ip:port:user:pass
+            if ':' in proxy_string:
                 parts = proxy_string.split(':')
                 if len(parts) == 2:
                     # ip:port
@@ -2960,37 +2941,10 @@ async def download_single_session(callback: types.CallbackQuery):
     except Exception as e:
         await msg.edit_text(f"❌ {e}")
    
-@dp.callback_query(F.data == "download_all_sessions")
-async def download_all_sessions(callback: types.CallbackQuery):
-    """Скачивает сессии всех аккаунтов"""
-    await callback.message.edit_text("🔄 Создаю архив со всеми сессиями...")
-    
-    # Получаем все товары
-    products = get_products()
-    product_ids = [p[0] for p in products if len(p) >= 5 and p[4]]
-    
-    if not product_ids:
-        await callback.message.edit_text("❌ Нет аккаунтов с сессиями.")
-        await callback.answer()
-        return
-    
-    # Создаем архив
-    zip_data = await create_session_zip(product_ids)
-    
-    if not zip_data:
-        await callback.message.edit_text("❌ Не удалось создать архив.")
-        await callback.answer()
-        return
-    
-    # Отправляем файл
-    import io
-    file = io.BytesIO(zip_data)
-    file.name = f"all_accounts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
-    
-    await callback.message.answer_document(
-        types.BufferedInputFile(file.getvalue(), filename=file.name),
-        caption=f"📥 Архив со всеми сессиями ({len(product_ids)} аккаунтов)"
-    )
+await callback.message.answer_document(
+    BufferedInputFile(file.getvalue(), filename=file.name),
+    caption=f"📥 Архив со всеми сессиями ({len(product_ids)} аккаунтов)"
+)
     await callback.answer()
     
 @dp.callback_query(F.data == "admin_delete_by_phone")
