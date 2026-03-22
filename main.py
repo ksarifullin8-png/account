@@ -1835,8 +1835,7 @@ def main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
         [KeyboardButton(text="🛍 КАТАЛОГ")],
         [KeyboardButton(text="💰 БАЛАНС"), KeyboardButton(text="👤 ПРОФИЛЬ")],
         [KeyboardButton(text="👥 РЕФЕРАЛЫ"), KeyboardButton(text="📜 ПОКУПКИ")],
-        [KeyboardButton(text="📝 ОТЗЫВЫ"), KeyboardButton(text="📞 ПОДДЕРЖКА")],
-        [KeyboardButton(text="🔑 ПОЛУЧИТЬ КОДЫ")]  # ← НОВАЯ КНОПКА
+        [KeyboardButton(text="📝 ОТЗЫВЫ"), KeyboardButton(text="📞 ПОДДЕРЖКА")]
     ]
     if user_id in ADMIN_IDS:
         buttons.append([KeyboardButton(text="⚙️ АДМИН")])
@@ -1849,7 +1848,8 @@ def admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📱 УДАЛИТЬ ПО НОМЕРУ", callback_data="admin_delete_by_phone")],
         [InlineKeyboardButton(text="📦 СПИСОК ТОВАРОВ", callback_data="admin_list_products")],
         [InlineKeyboardButton(text="📥 СКАЧАТЬ СЕССИИ", callback_data="admin_download_sessions")],
-        [InlineKeyboardButton(text="🔍 ПРОВЕРИТЬ СЕССИИ", callback_data="admin_check_sessions")],  # ← НОВАЯ КНОПКА
+        [InlineKeyboardButton(text="📥 СКАЧАТЬ БАЗУ ДАННЫХ", callback_data="admin_download_db")],  # ← НОВАЯ КНОПКА
+        [InlineKeyboardButton(text="🔍 ПРОВЕРИТЬ СЕССИИ", callback_data="admin_check_sessions")],
         [InlineKeyboardButton(text="📊 СТАТИСТИКА", callback_data="admin_stats")],
         [InlineKeyboardButton(text="💰 НАЧИСЛИТЬ БАЛАНС", callback_data="admin_add_balance")],
         [InlineKeyboardButton(text="📢 РАССЫЛКА", callback_data="admin_mailing")],
@@ -2811,6 +2811,7 @@ async def confirm_delete_invalid(callback: types.CallbackQuery, state: FSMContex
         
 @dp.callback_query(lambda c: c.data.startswith('session_file_'))
 async def session_file(callback: types.CallbackQuery):
+    """Скачивание файла сессии после покупки"""
     log_user_action(callback.from_user.id, "session_file")
     
     purchase_id = int(callback.data.split('_')[2])
@@ -2821,20 +2822,69 @@ async def session_file(callback: types.CallbackQuery):
         await callback.answer()
         return
     
-    pid, user_id, product_id, price, date, phone, session, region, year = purchase[:9]
+    await callback.answer("🔄 Создаю файл сессии...", show_alert=False)
     
-    filename = f"session_{phone}.session"
-    with open(filename, 'w', encoding='utf-8') as f:
-        f.write(session)
+    # Распаковываем покупку
+    if len(purchase) >= 10:
+        pid, user_id, product_id, price, date, phone, session_string, region, year, password = purchase[:10]
+    else:
+        pid, user_id, product_id, price, date, phone, session_string, region, year = purchase[:9]
     
-    with open(filename, 'rb') as f:
-        await callback.message.answer_document(
-            FSInputFile(filename),
-            caption=f"📁 ФАЙЛ СЕССИИ ДЛЯ {phone}"
-        )
+    import tempfile
+    import shutil
     
-    os.remove(filename)
-    await callback.answer()
+    temp_dir = None
+    try:
+        # Создаем временную директорию
+        temp_dir = tempfile.mkdtemp()
+        session_path = os.path.join(temp_dir, f"session_{phone.replace('+', '')}")
+        
+        # Создаем клиент с StringSession
+        client = TelegramClient(session_path, API_ID, API_HASH)
+        client.session = StringSession(session_string)
+        await client.connect()
+        
+        if await client.is_user_authorized():
+            # Сохраняем сессию в файл
+            client.session.save()
+            await client.disconnect()
+            
+            # Путь к сохраненному .session файлу
+            session_file_path = session_path + ".session"
+            
+            if os.path.exists(session_file_path):
+                # Читаем файл
+                with open(session_file_path, 'rb') as f:
+                    file_data = f.read()
+                
+                # Отправляем файл
+                clean_phone = phone.replace('+', '').replace(' ', '')
+                filename = f"telegram_{clean_phone}.session"
+                
+                await callback.message.answer_document(
+                    BufferedInputFile(file_data, filename=filename),
+                    caption=f"📁 <b>ФАЙЛ СЕССИИ</b>\n\n"
+                            f"📱 Телефон: <code>{phone}</code>\n"
+                            f"💰 Цена: {price} ₽\n"
+                            f"📅 Куплен: {date[:16]}\n\n"
+                            f"⚠️ Сохраните файл в безопасном месте!"
+                )
+            else:
+                await callback.message.answer("❌ Не удалось создать файл сессии")
+        else:
+            await callback.message.answer("❌ Сессия не авторизована")
+            
+    except Exception as e:
+        logger.error(f"Ошибка создания файла сессии: {e}")
+        await callback.message.answer(f"❌ Ошибка: {str(e)[:200]}")
+        
+    finally:
+        # Очищаем временные файлы
+        if temp_dir and os.path.exists(temp_dir):
+            try:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except:
+                pass
 
 # ==================== ПЛАТЕЖИ ====================
 @dp.callback_query(F.data == "show_payment_methods")
@@ -3021,6 +3071,42 @@ async def admin_download_sessions(callback: types.CallbackQuery):
     )
     await callback.answer()
     
+@dp.callback_query(F.data == "admin_download_db")
+async def admin_download_db(callback: types.CallbackQuery):
+    """Скачивание файла базы данных shop.db"""
+    await callback.answer("📦 Подготавливаю базу данных...", show_alert=False)
+    
+    try:
+        # Проверяем существование файла
+        db_path = 'shop.db'
+        if not os.path.exists(db_path):
+            await callback.message.edit_text("❌ Файл базы данных не найден!")
+            return
+        
+        # Получаем размер файла
+        file_size = os.path.getsize(db_path)
+        file_size_mb = file_size / (1024 * 1024)
+        
+        # Отправляем файл
+        with open(db_path, 'rb') as f:
+            file_data = f.read()
+        
+        # Создаем имя файла с датой
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"shop_backup_{timestamp}.db"
+        
+        await callback.message.answer_document(
+            BufferedInputFile(file_data, filename=filename),
+            caption=f"📥 <b>БАЗА ДАННЫХ</b>\n\n"
+                    f"📅 Дата: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n"
+                    f"📦 Размер: {file_size_mb:.2f} MB\n"
+                    f"⚠️ Храните в безопасном месте!"
+        )
+        
+    except Exception as e:
+        await callback.message.edit_text(f"❌ Ошибка: {e}")
+        logger.error(f"Ошибка скачивания БД: {e}")
+        
 @dp.callback_query(lambda c: c.data.startswith('download_session_'))
 async def download_single_session(callback: types.CallbackQuery):
     await callback.answer("🔄 Создаю архив...", show_alert=False)
@@ -3224,20 +3310,6 @@ async def crypto_amount_handler(message: types.Message, state: FSMContext):
         await state.clear()
     except ValueError:
         await message.answer("❌ ВВЕДИ ЧИСЛО")
-
-@dp.message(F.text == "🔑 ПОЛУЧИТЬ КОДЫ")
-async def get_codes_start(message: types.Message, state: FSMContext):
-    """Начало получения кодов из ZIP файла"""
-    await message.answer(
-        "📁 <b>ОТПРАВЬ ZIP ФАЙЛ С СЕССИЕЙ</b>\n\n"
-        "В ZIP архиве должен быть файл <code>session.session</code>\n"
-        "Пример структуры:\n"
-        "<code>account_123_+79001234567.zip\n"
-        "└── session.session</code>\n\n"
-        "После загрузки бот покажет последние 5 кодов."
-    )
-    await state.set_state(CodeRetrievalStates.waiting_for_zip)
-    
 
 
 async def process_zip_file(zip_bytes: bytes) -> list:
