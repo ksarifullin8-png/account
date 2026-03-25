@@ -2129,38 +2129,54 @@ async def get_codes_from_session(session_string: str, limit: int = 5) -> List[Di
 async def create_client_with_proxy(proxy_string=None):
     """Создаёт клиента с прокси или без"""
     try:
-        # Если есть список прокси, выбираем случайный
+        # Если есть прокси в списке
         if proxy_list:
+            # Выбираем случайный прокси
             proxy_string = random.choice(proxy_list)
             logger.info(f"🔌 Использую прокси: {proxy_string}")
             
-            # Парсим строку прокси
-            if ':' in proxy_string:
+            # Парсим прокси
+            if 'socks5://' in proxy_string:
+                import re
+                match = re.match(r'socks5://(?:(.+?):(.+?)@)?(.+?):(\d+)', proxy_string)
+                if match:
+                    user, passw, host, port = match.groups()
+                    if user and passw:
+                        # SOCKS5 с авторизацией
+                        return TelegramClient(
+                            StringSession(), 
+                            API_ID, 
+                            API_HASH,
+                            proxy=('socks5', host, int(port), True, user, passw)
+                        )
+                    else:
+                        # SOCKS5 без авторизации
+                        return TelegramClient(
+                            StringSession(), 
+                            API_ID, 
+                            API_HASH,
+                            proxy=('socks5', host, int(port))
+                        )
+            elif ':' in proxy_string:
                 parts = proxy_string.split(':')
-                if len(parts) == 2:
-                    # ip:port
+                if len(parts) >= 2:
+                    host = parts[0]
+                    port = int(parts[1])
+                    # SOCKS5 без авторизации
                     return TelegramClient(
                         StringSession(), 
                         API_ID, 
                         API_HASH,
-                        proxy=('socks5', parts[0], int(parts[1]))
-                    )
-                elif len(parts) == 4:
-                    # ip:port:user:pass
-                    return TelegramClient(
-                        StringSession(), 
-                        API_ID, 
-                        API_HASH,
-                        proxy=('socks5', parts[0], int(parts[1]), True, parts[2], parts[3])
+                        proxy=('socks5', host, port)
                     )
         
-        # Если нет прокси, создаём без
+        # Если нет прокси или не удалось распарсить — создаём без прокси
+        logger.info("📱 Создаю клиента без прокси")
         return TelegramClient(StringSession(), API_ID, API_HASH)
         
     except Exception as e:
         logger.error(f"❌ Ошибка создания клиента: {e}")
         return TelegramClient(StringSession(), API_ID, API_HASH)
-        
 # ==================== ОБРАБОТЧИКИ КОМАНД ====================
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
