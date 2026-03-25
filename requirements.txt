@@ -3,9 +3,9 @@ aiogram==3.26.0
 telethon==1.38.0
 requests==2.32.5
 python-dotenv==1.0.1
+PySocks==1.7.1
 
 # Дополнительно (опционально)
 python-dateutil==2.9.0.post0
 colorama==0.4.6
 cryptg==0.4.0
-socks
