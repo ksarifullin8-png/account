@@ -103,6 +103,7 @@ async def safe_edit_message(message, new_text, reply_markup=None):
         return message
 
 # ==================== СОСТОЯНИЯ FSM ====================
+# Добавь в класс ProductStates
 class ProductStates(StatesGroup):
     waiting_for_name = State()
     waiting_for_price = State()
@@ -110,6 +111,7 @@ class ProductStates(StatesGroup):
     waiting_for_account_password = State()
     waiting_for_code = State()
     waiting_for_password = State()
+    waiting_for_register_date = State()  # НОВОЕ СОСТОЯНИЕ
 
 class PaymentStates(StatesGroup):
     waiting_for_stars_amount = State()
@@ -698,10 +700,7 @@ def get_pending_payments_by_status(status: str = 'pending') -> List[Tuple]:
 
 # ==================== TELEGRAM AUTH ====================
 async def get_account_info(client):
-    """
-    Получает информацию об аккаунте с определением даты регистрации.
-    Использует 3 разных метода для максимальной точности.
-    """
+    """Получает информацию об аккаунте"""
     try:
         info = {
             'register_date': None,
@@ -712,130 +711,20 @@ async def get_account_info(client):
             'first_name': None,
             'last_name': None,
             'account_age_days': 0,
-            'register_year': None
+            'register_year': None,
+            'date_determined': False  # НОВОЕ ПОЛЕ
         }
         
-        me = await client.get_me()
-        info['phone'] = me.phone
-        info['username'] = me.username
-        info['first_name'] = me.first_name
-        info['last_name'] = me.last_name
+        # ... весь существующий код ...
         
-        # 🔥🔥🔥 МЕТОД 1: Через authorizations (САМЫЙ ТОЧНЫЙ) 🔥🔥🔥
-        try:
-            from telethon.tl.functions.account import GetAuthorizationsRequest
-            auths = await client(GetAuthorizationsRequest())
-            
-            if auths and hasattr(auths, 'authorizations') and auths.authorizations:
-                # Самая старая авторизация = дата создания
-                sorted_auths = sorted(auths.authorizations, key=lambda x: x.date_created)
-                oldest = sorted_auths[0]
-                reg_timestamp = oldest.date_created
-                reg_date = datetime.fromtimestamp(reg_timestamp)
-                
-                info['register_date'] = reg_date.strftime("%Y-%m-%d")
-                info['register_timestamp'] = reg_timestamp
-                info['register_year'] = reg_date.year
-                
-                days_old = (datetime.now() - reg_date).days
-                info['account_age_days'] = days_old
-                
-                logger.info(f"✅ МЕТОД 1: Дата регистрации: {info['register_date']} (через authorizations)")
-                return info
-        except Exception as e:
-            logger.warning(f"⚠️ МЕТОД 1 не сработал: {e}")
-        
-        # 🔥🔥🔥 МЕТОД 2: Через дату создания профиля 🔥🔥🔥
-        try:
-            from telethon.tl.functions.users import GetUsersRequest
-            from telethon.tl.types import User
-            
-            users = await client(GetUsersRequest([me]))
-            if users and users[0]:
-                user = users[0]
-                # Проверяем разные поля с датами
-                if hasattr(user, 'date') and user.date:
-                    created_date = user.date
-                    if isinstance(created_date, datetime):
-                        info['register_date'] = created_date.strftime("%Y-%m-%d")
-                        info['register_timestamp'] = int(created_date.timestamp())
-                        info['register_year'] = created_date.year
-                        
-                        days_old = (datetime.now() - created_date).days
-                        info['account_age_days'] = days_old
-                        
-                        logger.info(f"✅ МЕТОД 2: Дата регистрации: {info['register_date']} (через profile)")
-                        return info
-        except Exception as e:
-            logger.warning(f"⚠️ МЕТОД 2 не сработал: {e}")
-        
-        # 🔥🔥🔥 МЕТОД 3: Через ID аккаунта 🔥🔥🔥
-        try:
-            if me.id:
-                # Формула для приблизительной даты по ID Telegram
-                # ID Telegram содержит информацию о дате регистрации
-                # Формула: (id - 1000000000000) / 2^22 ≈ timestamp
-                approx_timestamp = (me.id - 1000000000000) / 4194304
-                if approx_timestamp > 1262304000:  # > 2010 года
-                    approx_date = datetime.fromtimestamp(approx_timestamp)
-                    info['register_date'] = approx_date.strftime("%Y-%m-%d") + " (приблизительно)"
-                    info['register_timestamp'] = int(approx_timestamp)
-                    info['register_year'] = approx_date.year
-                    
-                    days_old = (datetime.now() - approx_date).days
-                    info['account_age_days'] = days_old
-                    
-                    logger.info(f"✅ МЕТОД 3: Дата регистрации: {info['register_date']} (по ID)")
-                    return info
-        except Exception as e:
-            logger.warning(f"⚠️ МЕТОД 3 не сработал: {e}")
-        
-        # 🔥🔥🔥 МЕТОД 4: Через год создания (fallback) 🔥🔥🔥
-        if hasattr(me, 'date') and me.date:
-            try:
-                year = me.date.year
-                info['register_year'] = year
-                info['register_date'] = f"{year}-01-01 (только год)"
-                logger.info(f"✅ МЕТОД 4: Год регистрации: {year}")
-            except:
-                pass
-        
-        # 🔥🔥🔥 ПРОВЕРКА СПАМБЛОКА 🔥🔥🔥
-        try:
-            # Пробуем отправить тестовое сообщение самому себе
-            from telethon.tl.functions.messages import SendMessageRequest
-            
-            await client(SendMessageRequest(
-                peer=await client.get_input_entity(me.id),
-                message="test",
-                random_id=random.randint(0, 2**63)
-            ))
-            info['spam_block'] = 0
-            logger.info("🚫 Спамблок: НЕТ")
-        except Exception as e:
-            error_str = str(e)
-            if 'FLOOD_WAIT' in error_str or 'RESTRICTED' in error_str:
-                info['spam_block'] = 1
-                logger.info("🚫 Спамблок: ЕСТЬ")
-            else:
-                info['spam_block'] = 0
+        # Если ни один метод не сработал
+        if not info.get('register_date'):
+            info['date_determined'] = False
+            logger.warning("⚠️ Не удалось определить дату регистрации")
+        else:
+            info['date_determined'] = True
         
         return info
-        
-    except Exception as e:
-        logger.error(f"❌ Ошибка получения информации: {e}")
-        traceback.print_exc()
-        return {
-            'register_date': None,
-            'register_timestamp': 0,
-            'spam_block': 0,
-            'phone': None,
-            'username': None,
-            'first_name': None,
-            'last_name': None,
-            'account_age_days': 0,
-            'register_year': None
-        }
         
 async def detect_region(phone: str) -> str:
     # Европа
@@ -2853,15 +2742,26 @@ async def session_file(callback: types.CallbackQuery):
     try:
         # Создаем временную директорию
         temp_dir = tempfile.mkdtemp()
-        session_path = os.path.join(temp_dir, f"session_{phone.replace('+', '')}")
         
-        # Создаем клиент с StringSession
+        # Очищаем номер для имени файла
+        clean_phone = phone.replace('+', '').replace(' ', '').replace('-', '')
+        session_path = os.path.join(temp_dir, f"telegram_{clean_phone}")
+        
+        # СОЗДАЕМ КЛИЕНТ ПРАВИЛЬНО
         client = TelegramClient(session_path, API_ID, API_HASH)
+        
+        # ЗАГРУЖАЕМ STRING SESSION
         client.session = StringSession(session_string)
+        
         await client.connect()
         
         if await client.is_user_authorized():
-            # Сохраняем сессию в файл
+            # ПРОВЕРЯЕМ ЧТО СЕССИЯ РАБОТАЕТ
+            me = await client.get_me()
+            logger.info(f"✅ Клиент авторизован: {me.phone}")
+            
+            # СОХРАНЯЕМ СЕССИЮ В ФАЙЛ
+            # Важно: нужно сохранить именно бинарный .session файл
             client.session.save()
             await client.disconnect()
             
@@ -2874,7 +2774,6 @@ async def session_file(callback: types.CallbackQuery):
                     file_data = f.read()
                 
                 # Отправляем файл
-                clean_phone = phone.replace('+', '').replace(' ', '')
                 filename = f"telegram_{clean_phone}.session"
                 
                 await callback.message.answer_document(
@@ -2883,15 +2782,24 @@ async def session_file(callback: types.CallbackQuery):
                             f"📱 Телефон: <code>{phone}</code>\n"
                             f"💰 Цена: {price} ₽\n"
                             f"📅 Куплен: {date[:16]}\n\n"
-                            f"⚠️ Сохраните файл в безопасном месте!"
+                            f"⚠️ Сохраните файл в безопасном месте!\n"
+                            f"📌 Как использовать:\n"
+                            f"1. Установите Telethon\n"
+                            f"2. client = TelegramClient('session', API_ID, API_HASH)\n"
+                            f"3. client.start()"
                 )
+                
+                await callback.message.delete()  # Удаляем сообщение "создаю..."
+                logger.info(f"✅ Файл сессии отправлен для {phone}")
             else:
-                await callback.message.answer("❌ Не удалось создать файл сессии")
+                await callback.message.answer(f"❌ Не удалось создать файл сессии для {phone}")
+                logger.error(f"Файл не найден: {session_file_path}")
         else:
-            await callback.message.answer("❌ Сессия не авторизована")
+            await callback.message.answer("❌ Сессия не авторизована. Возможно, аккаунт был перезалогинен.")
             
     except Exception as e:
         logger.error(f"Ошибка создания файла сессии: {e}")
+        traceback.print_exc()
         await callback.message.answer(f"❌ Ошибка: {str(e)[:200]}")
         
     finally:
@@ -2902,6 +2810,7 @@ async def session_file(callback: types.CallbackQuery):
             except:
                 pass
 
+    
 # ==================== ПЛАТЕЖИ ====================
 @dp.callback_query(F.data == "show_payment_methods")
 async def show_payment_methods(callback: types.CallbackQuery):
@@ -3831,7 +3740,6 @@ async def product_code_handler(message: types.Message, state: FSMContext):
         error_text = result.get('error', 'НЕИЗВЕСТНАЯ ОШИБКА')
         await status_msg.edit_text(f"❌ {error_text}")
         
-        # Если код неверный, предлагаем попробовать снова
         if "Неверный код" in error_text:
             await message.answer(
                 "❌ Неверный код. Попробуй еще раз:",
@@ -3859,7 +3767,33 @@ async def product_code_handler(message: types.Message, state: FSMContext):
         register_date = account_info.get('register_date')
         spam_block = account_info.get('spam_block', 0)
         account_age = account_info.get('account_age_days', 0)
+        date_determined = account_info.get('date_determined', False)
         
+        # Если дата не определилась автоматически - запрашиваем вручную
+        if not date_determined or not register_date:
+            await state.update_data(
+                name=data['name'],
+                price=data['price'],
+                phone=result['phone'],
+                session=result['session'],
+                region=result['region'],
+                year=result['year'],
+                account_password=data.get('account_password'),
+                spam_block=spam_block,
+                account_age=account_age
+            )
+            await status_msg.edit_text(
+                f"⚠️ <b>НЕ УДАЛОСЬ АВТОМАТИЧЕСКИ ОПРЕДЕЛИТЬ ДАТУ РЕГИСТРАЦИИ</b>\n\n"
+                f"📱 Номер: {result['phone']}\n"
+                f"🌍 Регион: {result['region']}\n\n"
+                f"Введи дату регистрации аккаунта в формате:\n"
+                f"<b>ДД.ММ.ГГГГ</b> (например: 15.03.2023)\n\n"
+                f"Если не знаешь точную дату, отправь <b>?</b> для пропуска"
+            )
+            await state.set_state(ProductStates.waiting_for_register_date)
+            return
+        
+        # Если дата определилась - добавляем товар
         pid = add_product(
             data['name'],
             data['price'],
@@ -3889,6 +3823,63 @@ async def product_code_handler(message: types.Message, state: FSMContext):
         )
         await state.clear()
 
+@dp.message(ProductStates.waiting_for_register_date)
+async def product_register_date_handler(message: types.Message, state: FSMContext):
+    """Обработка ручного ввода даты регистрации"""
+    register_date = message.text.strip()
+    
+    data = await state.get_data()
+    
+    # Если пользователь пропускает
+    if register_date == '?':
+        register_date = None
+        reg_date_text = "неизвестно"
+    else:
+        # Проверяем формат даты
+        import re
+        if re.match(r'^\d{2}\.\d{2}\.\d{4}$', register_date):
+            # Конвертируем в формат YYYY-MM-DD для БД
+            day, month, year = register_date.split('.')
+            register_date = f"{year}-{month}-{day}"
+            reg_date_text = register_date
+        else:
+            await message.answer(
+                "❌ <b>НЕВЕРНЫЙ ФОРМАТ!</b>\n\n"
+                "Используй формат: <b>ДД.ММ.ГГГГ</b>\n"
+                "Пример: <code>15.03.2023</code>\n\n"
+                "Или отправь <b>?</b> чтобы пропустить:"
+            )
+            return
+    
+    # Добавляем товар
+    pid = add_product(
+        data['name'],
+        data['price'],
+        data['phone'],
+        data['session'],
+        data['region'],
+        data['year'],
+        data.get('account_password'),
+        data.get('spam_block', 0),
+        register_date,
+        data.get('account_age', 0)
+    )
+    
+    spam_text = "✅ НЕТ" if data.get('spam_block', 0) == 0 else "❌ ЕСТЬ"
+    
+    await message.answer(
+        f"✅ <b>АККАУНТ УСПЕШНО ДОБАВЛЕН!</b>\n\n"
+        f"📦 НАЗВАНИЕ: <b>{data['name']}</b>\n"
+        f"💰 ЦЕНА: <code>{data['price']} ₽</code>\n"
+        f"🌍 РЕГИОН: {data['region']}\n"
+        f"📅 ГОД ВЫСТАВЛЕНИЕ НА ПРОДАЖУ: {data['year']}\n"
+        f"📆 ДАТА РЕГА АККА: <b>{reg_date_text}</b>\n"
+        f"🚫 СПАМБЛОК: <b>{spam_text}</b>\n"
+        f"🔑 ПАРОЛЬ: <code>{data.get('account_password', 'НЕТ')}</code>\n"
+        f"🆔 ID: <code>{pid}</code>"
+    )
+    await state.clear()
+    
 @dp.callback_query(F.data == "resend_code")
 async def resend_code_handler(callback: types.CallbackQuery, state: FSMContext):
     """Повторная отправка кода"""
