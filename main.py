@@ -700,7 +700,10 @@ def get_pending_payments_by_status(status: str = 'pending') -> List[Tuple]:
 
 # ==================== TELEGRAM AUTH ====================
 async def get_account_info(client):
-    """Получает информацию об аккаунте"""
+    """
+    Получает информацию об аккаунте с определением даты регистрации.
+    Использует 3 разных метода для максимальной точности.
+    """
     try:
         info = {
             'register_date': None,
@@ -715,16 +718,137 @@ async def get_account_info(client):
             'date_determined': False  # НОВОЕ ПОЛЕ
         }
         
-        # ... весь существующий код ...
+        me = await client.get_me()
+        info['phone'] = me.phone
+        info['username'] = me.username
+        info['first_name'] = me.first_name
+        info['last_name'] = me.last_name
+        
+        # 🔥🔥🔥 МЕТОД 1: Через authorizations (САМЫЙ ТОЧНЫЙ) 🔥🔥🔥
+        try:
+            from telethon.tl.functions.account import GetAuthorizationsRequest
+            auths = await client(GetAuthorizationsRequest())
+            
+            if auths and hasattr(auths, 'authorizations') and auths.authorizations:
+                # Самая старая авторизация = дата создания
+                sorted_auths = sorted(auths.authorizations, key=lambda x: x.date_created)
+                oldest = sorted_auths[0]
+                reg_timestamp = oldest.date_created
+                reg_date = datetime.fromtimestamp(reg_timestamp)
+                
+                info['register_date'] = reg_date.strftime("%Y-%m-%d")
+                info['register_timestamp'] = reg_timestamp
+                info['register_year'] = reg_date.year
+                info['date_determined'] = True
+                
+                days_old = (datetime.now() - reg_date).days
+                info['account_age_days'] = days_old
+                
+                logger.info(f"✅ МЕТОД 1: Дата регистрации: {info['register_date']} (через authorizations)")
+                return info
+        except Exception as e:
+            logger.warning(f"⚠️ МЕТОД 1 не сработал: {e}")
+        
+        # 🔥🔥🔥 МЕТОД 2: Через дату создания профиля 🔥🔥🔥
+        try:
+            from telethon.tl.functions.users import GetUsersRequest
+            from telethon.tl.types import User
+            
+            users = await client(GetUsersRequest([me]))
+            if users and users[0]:
+                user = users[0]
+                # Проверяем разные поля с датами
+                if hasattr(user, 'date') and user.date:
+                    created_date = user.date
+                    if isinstance(created_date, datetime):
+                        info['register_date'] = created_date.strftime("%Y-%m-%d")
+                        info['register_timestamp'] = int(created_date.timestamp())
+                        info['register_year'] = created_date.year
+                        info['date_determined'] = True
+                        
+                        days_old = (datetime.now() - created_date).days
+                        info['account_age_days'] = days_old
+                        
+                        logger.info(f"✅ МЕТОД 2: Дата регистрации: {info['register_date']} (через profile)")
+                        return info
+        except Exception as e:
+            logger.warning(f"⚠️ МЕТОД 2 не сработал: {e}")
+        
+        # 🔥🔥🔥 МЕТОД 3: Через ID аккаунта 🔥🔥🔥
+        try:
+            if me.id:
+                # Формула для приблизительной даты по ID Telegram
+                # ID Telegram содержит информацию о дате регистрации
+                # Формула: (id - 1000000000000) / 2^22 ≈ timestamp
+                approx_timestamp = (me.id - 1000000000000) / 4194304
+                if approx_timestamp > 1262304000:  # > 2010 года
+                    approx_date = datetime.fromtimestamp(approx_timestamp)
+                    info['register_date'] = approx_date.strftime("%Y-%m-%d") + " (приблизительно)"
+                    info['register_timestamp'] = int(approx_timestamp)
+                    info['register_year'] = approx_date.year
+                    info['date_determined'] = True
+                    
+                    days_old = (datetime.now() - approx_date).days
+                    info['account_age_days'] = days_old
+                    
+                    logger.info(f"✅ МЕТОД 3: Дата регистрации: {info['register_date']} (по ID)")
+                    return info
+        except Exception as e:
+            logger.warning(f"⚠️ МЕТОД 3 не сработал: {e}")
+        
+        # 🔥🔥🔥 МЕТОД 4: Через год создания (fallback) 🔥🔥🔥
+        if hasattr(me, 'date') and me.date:
+            try:
+                year = me.date.year
+                info['register_year'] = year
+                info['register_date'] = f"{year}-01-01 (только год)"
+                info['date_determined'] = True
+                logger.info(f"✅ МЕТОД 4: Год регистрации: {year}")
+            except:
+                pass
         
         # Если ни один метод не сработал
         if not info.get('register_date'):
             info['date_determined'] = False
             logger.warning("⚠️ Не удалось определить дату регистрации")
-        else:
-            info['date_determined'] = True
+        
+        # 🔥🔥🔥 ПРОВЕРКА СПАМБЛОКА 🔥🔥🔥
+        try:
+            # Пробуем отправить тестовое сообщение самому себе
+            from telethon.tl.functions.messages import SendMessageRequest
+            
+            await client(SendMessageRequest(
+                peer=await client.get_input_entity(me.id),
+                message="test",
+                random_id=random.randint(0, 2**63)
+            ))
+            info['spam_block'] = 0
+            logger.info("🚫 Спамблок: НЕТ")
+        except Exception as e:
+            error_str = str(e)
+            if 'FLOOD_WAIT' in error_str or 'RESTRICTED' in error_str:
+                info['spam_block'] = 1
+                logger.info("🚫 Спамблок: ЕСТЬ")
+            else:
+                info['spam_block'] = 0
         
         return info
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения информации: {e}")
+        traceback.print_exc()
+        return {
+            'register_date': None,
+            'register_timestamp': 0,
+            'spam_block': 0,
+            'phone': None,
+            'username': None,
+            'first_name': None,
+            'last_name': None,
+            'account_age_days': 0,
+            'register_year': None,
+            'date_determined': False
+        }
         
 async def detect_region(phone: str) -> str:
     # Европа
