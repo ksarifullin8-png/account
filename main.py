@@ -168,7 +168,7 @@ def init_db():
         total_referral_earnings REAL DEFAULT 0
     )''')
     
-    # Таблица товаров (с паролем и расширенными полями)
+    # Таблица товаров
     c.execute('''CREATE TABLE IF NOT EXISTS products (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT,
@@ -184,7 +184,7 @@ def init_db():
         account_age INTEGER DEFAULT 0
     )''')
     
-    # Таблица покупок (с паролем)
+    # Таблица покупок
     c.execute('''CREATE TABLE IF NOT EXISTS purchases (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
@@ -241,7 +241,7 @@ def init_db():
         timestamp TEXT
     )''')
     
-    # Таблица активаций рефералов (новая)
+    # ========== ТАБЛИЦА РЕФЕРАЛОВ (ВАЖНО!) ==========
     c.execute('''CREATE TABLE IF NOT EXISTS referral_activations (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         referrer_id INTEGER,
@@ -251,26 +251,25 @@ def init_db():
         UNIQUE(referrer_id, referred_id)
     )''')
     
-    # Настройки по умолчанию (не перезаписывают существующие)
+    # Настройки по умолчанию
     default_settings = [
         ('stars_rate', str(STARS_RATE)),
         ('usdt_rate', str(USDT_RATE)),
         ('referral_discount', '10'),
-        ('referral_reward', '5'),
-        ('referral_fixed_reward', '3'),           # фиксированная награда за активацию
-        ('referral_activation_threshold', '70'), # порог активации (покупка/пополнение)
+        ('referral_reward', '20'),
+        ('referral_fixed_reward', '3'),
+        ('referral_activation_threshold', '70'),
         ('reviews_channel_link', 'https://t.me/+UuMm3vm8C69mNTdi')
     ]
     
     for key, value in default_settings:
         c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, value))
     
-    # Проверяем наличие колонок в существующих таблицах и добавляем при необходимости
-    # (для совместимости, если таблица создана ранее без этих полей)
+    # Добавляем недостающие колонки в products (если их нет)
     try:
         c.execute("ALTER TABLE products ADD COLUMN spam_block INTEGER DEFAULT 0")
     except sqlite3.OperationalError:
-        pass  # колонка уже есть
+        pass
     try:
         c.execute("ALTER TABLE products ADD COLUMN register_date TEXT")
     except sqlite3.OperationalError:
@@ -282,7 +281,7 @@ def init_db():
     
     conn.commit()
     conn.close()
-    logger.info("✅ База данных инициализирована (существующие данные сохранены)")
+    logger.info("✅ База данных инициализирована")
 
 # ==================== ФУНКЦИИ ДЛЯ РАБОТЫ С БАНАМИ ====================
 def ban_user(user_id: int, reason: str = "Спам", admin_id: int = None):
@@ -1409,7 +1408,7 @@ async def detect_region(phone: str) -> str:
     elif phone.startswith('+672'):
         return '🇦🇶 Антарктида'
     elif phone.startswith('+673'):
-        return '🇧🇳 Бруней'
+        return '🇧?? Бруней'
     elif phone.startswith('+674'):
         return '🇳🇷 Науру'
     elif phone.startswith('+675'):
