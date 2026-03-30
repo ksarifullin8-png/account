@@ -137,6 +137,8 @@ class AdminSettingsStates(StatesGroup):
     waiting_for_usdt = State()
     waiting_for_discount = State()
     waiting_for_reward = State()
+    waiting_for_fixed_reward = State()  # НОВОЕ СОСТОЯНИЕ
+    waiting_for_activation_threshold = State()  # НОВОЕ СОСТОЯНИЕ
     waiting_for_reviews_channel = State()
 
 class MailingStates(StatesGroup):
@@ -166,7 +168,7 @@ def init_db():
         total_referral_earnings REAL DEFAULT 0
     )''')
     
-    # Таблица товаров (с паролем)
+    # Таблица товаров (с паролем и расширенными полями)
     c.execute('''CREATE TABLE IF NOT EXISTS products (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT,
@@ -176,7 +178,10 @@ def init_db():
         region TEXT,
         account_year INTEGER,
         added_date TEXT,
-        password TEXT
+        password TEXT,
+        spam_block INTEGER DEFAULT 0,
+        register_date TEXT,
+        account_age INTEGER DEFAULT 0
     )''')
     
     # Таблица покупок (с паролем)
@@ -236,24 +241,48 @@ def init_db():
         timestamp TEXT
     )''')
     
+    # Таблица активаций рефералов (новая)
+    c.execute('''CREATE TABLE IF NOT EXISTS referral_activations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        referrer_id INTEGER,
+        referred_id INTEGER,
+        activated INTEGER DEFAULT 0,
+        activated_date TEXT,
+        UNIQUE(referrer_id, referred_id)
+    )''')
+    
     # Настройки по умолчанию (не перезаписывают существующие)
     default_settings = [
         ('stars_rate', str(STARS_RATE)),
         ('usdt_rate', str(USDT_RATE)),
         ('referral_discount', '10'),
         ('referral_reward', '5'),
+        ('referral_fixed_reward', '3'),           # фиксированная награда за активацию
+        ('referral_activation_threshold', '70'), # порог активации (покупка/пополнение)
         ('reviews_channel_link', 'https://t.me/+UuMm3vm8C69mNTdi')
     ]
     
     for key, value in default_settings:
         c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, value))
     
+    # Проверяем наличие колонок в существующих таблицах и добавляем при необходимости
+    # (для совместимости, если таблица создана ранее без этих полей)
+    try:
+        c.execute("ALTER TABLE products ADD COLUMN spam_block INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # колонка уже есть
+    try:
+        c.execute("ALTER TABLE products ADD COLUMN register_date TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        c.execute("ALTER TABLE products ADD COLUMN account_age INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    
     conn.commit()
     conn.close()
     logger.info("✅ База данных инициализирована (существующие данные сохранены)")
-
-# Инициализация БД
-init_db()
 
 # ==================== ФУНКЦИИ ДЛЯ РАБОТЫ С БАНАМИ ====================
 def ban_user(user_id: int, reason: str = "Спам", admin_id: int = None):
@@ -290,6 +319,112 @@ def is_banned(user_id: int) -> bool:
     conn.close()
     return result is not None
 
+def is_referral_activated(referrer_id: int, referred_id: int) -> bool:
+    """Проверяет, активирован ли реферал"""
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    c.execute("SELECT activated FROM referral_activations WHERE referrer_id = ? AND referred_id = ?", 
+              (referrer_id, referred_id))
+    result = c.fetchone()
+    conn.close()
+    return result and result[0] == 1
+
+async def activate_referral(referrer_id: int, referred_id: int, referred_username: str = None):
+    """Активирует реферала и начисляет награду"""
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    
+    # Проверяем, существует ли запись
+    c.execute("SELECT activated FROM referral_activations WHERE referrer_id = ? AND referred_id = ?", 
+              (referrer_id, referred_id))
+    existing = c.fetchone()
+    
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    if not existing:
+        # Создаем новую запись
+        c.execute("""INSERT INTO referral_activations 
+                     (referrer_id, referred_id, activated, activated_date) 
+                     VALUES (?, ?, ?, ?)""",
+                  (referrer_id, referred_id, 1, now))
+    elif existing[0] == 0:
+        # Обновляем существующую
+        c.execute("""UPDATE referral_activations 
+                     SET activated = 1, activated_date = ? 
+                     WHERE referrer_id = ? AND referred_id = ?""",
+                  (now, referrer_id, referred_id))
+    else:
+        # Уже активирован
+        conn.close()
+        return False
+    
+    # Начисляем награду
+    fixed_reward = get_setting('referral_fixed_reward')
+    update_balance(referrer_id, fixed_reward)
+    
+    # Обновляем статистику
+    c.execute("UPDATE users SET total_referral_earnings = total_referral_earnings + ? WHERE user_id = ?",
+              (fixed_reward, referrer_id))
+    
+    conn.commit()
+    conn.close()
+    
+    # Отправляем уведомление рефереру
+    try:
+        username_text = f"@{referred_username}" if referred_username else f"ID {referred_id}"
+        await bot.send_message(
+            referrer_id,
+            f"🎉 <b>Реферал активирован!</b>\n\n"
+            f"👤 Пользователь: {username_text}\n"
+            f"💎 Награда: <code>{fixed_reward} ₽</code>\n"
+            f"💰 Баланс пополнен!"
+        )
+    except Exception as e:
+        logger.error(f"Не удалось отправить уведомление рефереру {referrer_id}: {e}")
+    
+    return True
+
+async def check_and_activate_referral(user_id: int, amount_spent: float = None):
+    """Проверяет, нужно ли активировать реферала при покупке/пополнении"""
+    conn = sqlite3.connect('shop.db')
+    c = conn.cursor()
+    
+    # Получаем реферера пользователя
+    c.execute("SELECT referrer_id FROM users WHERE user_id = ?", (user_id,))
+    result = c.fetchone()
+    
+    if not result or not result[0]:
+        conn.close()
+        return False
+    
+    referrer_id = result[0]
+    
+    # Получаем username реферала для уведомления
+    c.execute("SELECT username FROM users WHERE user_id = ?", (user_id,))
+    referred_username = c.fetchone()
+    referred_username = referred_username[0] if referred_username else None
+    
+    # Проверяем, не активирован ли уже
+    c.execute("SELECT activated FROM referral_activations WHERE referrer_id = ? AND referred_id = ?",
+              (referrer_id, user_id))
+    activated = c.fetchone()
+    
+    if activated and activated[0] == 1:
+        conn.close()
+        return False
+    
+    # Если сумма покупки указана и она больше порога
+    threshold = get_setting('referral_activation_threshold')
+    
+    if amount_spent is not None and amount_spent >= threshold:
+        # Активируем реферала
+        result = await activate_referral(referrer_id, user_id, referred_username)
+        conn.close()
+        return result
+    
+    conn.close()
+    return False
+    
 def get_banned_users() -> List[Tuple]:
     """Получить список забаненных"""
     conn = sqlite3.connect('shop.db')
@@ -395,6 +530,9 @@ def get_user(user_id: int, username: str = None, referrer_id: int = None) -> Opt
         
         if referrer_id:
             c.execute("UPDATE users SET total_referrals = total_referrals + 1 WHERE user_id = ?", (referrer_id,))
+            # ✅ ДОБАВЛЯЕМ ЗАПИСЬ В referral_activations
+            c.execute("INSERT OR IGNORE INTO referral_activations (referrer_id, referred_id, activated, activated_date) VALUES (?, ?, ?, ?)",
+                      (referrer_id, user_id, 0, None))
         
         conn.commit()
         c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
@@ -447,15 +585,28 @@ proxy_list = load_proxies()
 def get_referral_stats(user_id: int) -> Dict:
     conn = sqlite3.connect('shop.db')
     c = conn.cursor()
+    
+    # Получаем всех приглашенных
     c.execute("SELECT username, registered_date FROM users WHERE referrer_id = ?", (user_id,))
     referrals = c.fetchall()
+    
+    # Получаем количество активированных
+    c.execute("SELECT COUNT(*) FROM referral_activations WHERE referrer_id = ? AND activated = 1", (user_id,))
+    activated_count = c.fetchone()[0]
+    
     c.execute("SELECT total_referrals, total_referral_earnings FROM users WHERE user_id = ?", (user_id,))
     stats = c.fetchone()
+    
     conn.close()
+    
+    fixed_reward = get_setting('referral_fixed_reward')
+    
     return {
         'referrals': referrals,
         'total_count': stats[0] if stats else 0,
-        'total_earnings': stats[1] if stats else 0
+        'activated_count': activated_count,
+        'total_earnings': stats[1] if stats else 0,
+        'fixed_reward': fixed_reward
     }
 
 def get_all_users() -> List[Tuple]:
@@ -477,7 +628,9 @@ def get_setting(key: str) -> Any:
     if result is None:
         return None
     
-    if key in ['stars_rate', 'usdt_rate', 'referral_discount', 'referral_reward']:
+    # Добавляем новые ключи в список числовых
+    if key in ['stars_rate', 'usdt_rate', 'referral_discount', 'referral_reward',
+               'referral_fixed_reward', 'referral_activation_threshold']:
         return float(result[0])
     return result[0]
 
@@ -1846,12 +1999,14 @@ def admin_settings_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⭐ КУРС STARS", callback_data="set_stars")],
         [InlineKeyboardButton(text="💵 КУРС USDT", callback_data="set_usdt")],
         [InlineKeyboardButton(text="🎁 СКИДКА РЕФЕРАЛАМ", callback_data="set_discount")],
-        [InlineKeyboardButton(text="💸 НАГРАДА ЗА РЕФЕРАЛА", callback_data="set_reward")],
+        [InlineKeyboardButton(text="💰 НАГРАДА %", callback_data="set_reward")],
+        [InlineKeyboardButton(text="💎 ФИКС. НАГРАДА ₽", callback_data="set_fixed_reward")],  # НОВАЯ КНОПКА
+        [InlineKeyboardButton(text="📊 ПОРОГ АКТИВАЦИИ", callback_data="set_activation_threshold")],  # НОВАЯ КНОПКА
         [InlineKeyboardButton(text="📢 КАНАЛ ОТЗЫВОВ", callback_data="set_reviews_channel")],
         [InlineKeyboardButton(text="🔙 НАЗАД", callback_data="admin_back")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
-
+    
 def payment_keyboard() -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(text="⭐ TELEGRAM STARS", callback_data="pay_stars")],
@@ -2404,16 +2559,33 @@ async def ref_stats(callback: types.CallbackQuery):
     log_user_action(user_id, "ref_stats")
     
     stats = get_referral_stats(user_id)
+    fixed_reward = stats['fixed_reward']
+    threshold = get_setting('referral_activation_threshold')
+    
     text = f"📊 <b>СТАТИСТИКА РЕФЕРАЛОВ</b>\n\n"
     text += f"👥 ПРИГЛАШЕНО: <b>{stats['total_count']}</b>\n"
-    text += f"💰 ЗАРАБОТАНО: <b>{stats['total_earnings']} ₽</b>\n\n"
+    text += f"✅ АКТИВИРОВАНО: <b>{stats['activated_count']}</b>\n"
+    text += f"💎 НАГРАДА ЗА АКТИВАЦИЮ: <b>{fixed_reward} ₽</b>\n"
+    text += f"💰 ЗАРАБОТАНО ВСЕГО: <b>{stats['total_earnings']} ₽</b>\n\n"
+    
+    text += f"ℹ️ <b>КАК АКТИВИРОВАТЬ РЕФЕРАЛА:</b>\n"
+    text += f"Реферал должен совершить покупку или пополнить баланс\n"
+    text += f"на сумму ≥ <b>{threshold} ₽</b>\n\n"
     
     if stats['referrals']:
-        text += "СПИСОК РЕФЕРАЛОВ:\n"
+        text += "📋 <b>СПИСОК РЕФЕРАЛОВ:</b>\n"
         for ref in stats['referrals']:
             username = ref[0] if ref[0] else "БЕЗ USERNAME"
             date = ref[1][:10] if ref[1] else "НЕИЗВЕСТНО"
-            text += f"👤 @{username} | 📅 {date}\n"
+            # Проверяем, активирован ли
+            conn = sqlite3.connect('shop.db')
+            c = conn.cursor()
+            c.execute("SELECT activated FROM referral_activations WHERE referrer_id = ? AND referred_id = ?", 
+                      (user_id, ref[0]))
+            activated = c.fetchone()
+            conn.close()
+            status = "✅" if (activated and activated[0]) else "⏳"
+            text += f"{status} @{username} | 📅 {date}\n"
     else:
         text += "📭 У ТЕБЯ ПОКА НЕТ РЕФЕРАЛОВ."
     
@@ -2523,68 +2695,6 @@ async def view_product(callback: types.CallbackQuery):
     )
     
     await safe_edit_message(callback.message, text, product_keyboard(product_id))
-    await callback.answer()
-
-@dp.callback_query(lambda c: c.data.startswith('buy_'))
-async def buy_product(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    log_user_action(user_id, "buy_product")
-    
-    product_id = int(callback.data.split('_')[1])
-    product = get_product(product_id)
-    
-    if not product:
-        await safe_edit_message(callback.message, "❌ ТОВАР НЕ НАЙДЕН.")
-        await callback.answer()
-        return
-    
-    if len(product) >= 9:
-        product_id, name, price, phone, session, region, year, added, password = product[:9]
-    else:
-        product_id, name, price, phone, session, region, year, added = product[:8]
-        password = None
-    
-    user_balance = get_balance(user_id)
-    
-    if user_balance >= price:
-        update_balance(user_id, -price)
-        
-        purchase_id = add_purchase(
-            user_id,
-            product_id,
-            price,
-            phone,
-            session,
-            region,
-            year,
-            password
-        )
-        
-        delete_product(product_id)
-        age = datetime.now().year - year
-        
-        text = (
-            f"✅ <b>ПОКУПКА УСПЕШНА!</b>\n\n"
-            f"📦 ТОВАР: <b>{name}</b>\n"
-            f"💰 ЦЕНА: <code>{price} ₽</code>\n"
-            f"🌍 РЕГИОН: {region}\n"
-            f"📅 ГОД: {year} ({age} ЛЕТ)\n"
-            f"📱 ТЕЛЕФОН: <code>{phone}</code>\n"
-        )
-        
-        if password and password not in ['None', '']:
-            text += f"🔑 ПАРОЛЬ АККАУНТА: <code>{password}</code>\n"
-        
-        text += f"\n📁 ФАЙЛ СЕССИИ ДОСТУПЕН В РАЗДЕЛЕ ПОКУПКИ"
-        
-        await safe_edit_message(callback.message, text)
-    else:
-        need = price - user_balance
-        await safe_edit_message(
-            callback.message,
-            f"❌ <b>НЕДОСТАТОЧНО СРЕДСТВ</b>\n\nНУЖНО ЕЩЕ: <code>{need} ₽</code>",
-            insufficient_balance_keyboard()
-        )
     await callback.answer()
 
 # ==================== ДЕТАЛИ ПОКУПКИ ====================
@@ -2749,6 +2859,157 @@ async def admin_check_all_sessions(callback: types.CallbackQuery):
         await callback.message.edit_text(f"❌ Ошибка проверки: {e}")
         logger.error(f"Ошибка проверки сессий: {e}")
 
+@dp.callback_query(F.data == "set_fixed_reward")
+async def set_fixed_reward(callback: types.CallbackQuery, state: FSMContext):
+    current = get_setting('referral_fixed_reward')
+    await safe_edit_message(
+        callback.message,
+        f"💰 <b>НАСТРОЙКА ФИКСИРОВАННОЙ НАГРАДЫ</b>\n\n"
+        f"Текущая награда: <b>{current} ₽</b> за активированного реферала\n\n"
+        f"Награда начисляется, когда реферал:\n"
+        f"• Совершит покупку в каталоге\n"
+        f"• Или пополнит баланс на сумму ≥ порога активации\n\n"
+        f"Введи новую сумму в рублях:"
+    )
+    await state.set_state(AdminSettingsStates.waiting_for_fixed_reward)
+    await callback.answer()
+
+@dp.message(AdminSettingsStates.waiting_for_fixed_reward)
+async def fixed_reward_set_handler(message: types.Message, state: FSMContext):
+    try:
+        val = float(message.text)
+        if val < 0:
+            await message.answer("❌ Сумма не может быть отрицательной")
+            return
+        update_setting('referral_fixed_reward', val)
+        await message.answer(f"✅ Фиксированная награда установлена: <b>{val} ₽</b>\n\n"
+                            f"Теперь за каждого активированного реферала будет начисляться {val} ₽")
+        await state.clear()
+    except ValueError:
+        await message.answer("❌ Введи число")
+
+@dp.callback_query(F.data == "set_activation_threshold")
+async def set_activation_threshold(callback: types.CallbackQuery, state: FSMContext):
+    current = get_setting('referral_activation_threshold')
+    await safe_edit_message(
+        callback.message,
+        f"📊 <b>НАСТРОЙКА ПОРОГА АКТИВАЦИИ</b>\n\n"
+        f"Текущий порог: <b>{current} ₽</b>\n\n"
+        f"Реферал считается активированным, когда:\n"
+        f"• Совершит покупку на сумму ≥ порога\n"
+        f"• Или пополнит баланс на сумму ≥ порога\n\n"
+        f"Введи новую сумму в рублях:"
+    )
+    await state.set_state(AdminSettingsStates.waiting_for_activation_threshold)
+    await callback.answer()
+
+@dp.message(AdminSettingsStates.waiting_for_activation_threshold)
+async def activation_threshold_set_handler(message: types.Message, state: FSMContext):
+    try:
+        val = float(message.text)
+        if val < 0:
+            await message.answer("❌ Сумма не может быть отрицательной")
+            return
+        update_setting('referral_activation_threshold', val)
+        await message.answer(f"✅ Порог активации установлен: <b>{val} ₽</b>\n\n"
+                            f"Теперь реферал активируется при покупке или пополнении на сумму ≥ {val} ₽")
+        await state.clear()
+    except ValueError:
+        await message.answer("❌ Введи число")
+        
+@dp.callback_query(lambda c: c.data.startswith('buy_'))
+async def buy_product(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    log_user_action(user_id, "buy_product")
+    
+    product_id = int(callback.data.split('_')[1])
+    product = get_product(product_id)
+    
+    if not product:
+        await safe_edit_message(callback.message, "❌ ТОВАР НЕ НАЙДЕН.")
+        await callback.answer()
+        return
+    
+    if len(product) >= 9:
+        product_id, name, price, phone, session, region, year, added, password = product[:9]
+    else:
+        product_id, name, price, phone, session, region, year, added = product[:8]
+        password = None
+    
+    user_balance = get_balance(user_id)
+    
+    if user_balance >= price:
+        update_balance(user_id, -price)
+        
+        # ✅ АКТИВАЦИЯ РЕФЕРАЛА
+        await check_and_activate_referral(user_id, price)
+        
+        purchase_id = add_purchase(
+            user_id,
+            product_id,
+            price,
+            phone,
+            session,
+            region,
+            year,
+            password
+        )
+        
+        delete_product(product_id)
+        age = datetime.now().year - year
+        
+        text = (
+            f"✅ <b>ПОКУПКА УСПЕШНА!</b>\n\n"
+            f"📦 ТОВАР: <b>{name}</b>\n"
+            f"💰 ЦЕНА: <code>{price} ₽</code>\n"
+            f"🌍 РЕГИОН: {region}\n"
+            f"📅 ГОД: {year} ({age} ЛЕТ)\n"
+            f"📱 ТЕЛЕФОН: <code>{phone}</code>\n"
+        )
+        
+        if password and password not in ['None', '']:
+            text += f"🔑 ПАРОЛЬ АККАУНТА: <code>{password}</code>\n"
+        
+        text += f"\n📁 ФАЙЛ СЕССИИ ДОСТУПЕН В РАЗДЕЛЕ ПОКУПКИ"
+        
+        await safe_edit_message(callback.message, text)
+    else:
+        need = price - user_balance
+        await safe_edit_message(
+            callback.message,
+            f"❌ <b>НЕДОСТАТОЧНО СРЕДСТВ</b>\n\nНУЖНО ЕЩЕ: <code>{need} ₽</code>",
+            insufficient_balance_keyboard()
+        )
+    await callback.answer()
+    
+@dp.message(F.successful_payment)
+async def successful_payment_handler(message: types.Message):
+    payload = message.successful_payment.invoice_payload
+    
+    if payload.startswith("stars_"):
+        conn = sqlite3.connect('shop.db')
+        c = conn.cursor()
+        c.execute("SELECT id, user_id, amount FROM pending_payments WHERE invoice_id = ? AND status='pending'", (payload,))
+        payment = c.fetchone()
+        conn.close()
+        
+        if payment:
+            pid, uid, amt = payment
+            update_balance(uid, amt)
+            update_payment_status(pid, 'confirmed')
+            
+            # ✅ АКТИВАЦИЯ РЕФЕРАЛА ПРИ ПОПОЛНЕНИИ
+            await check_and_activate_referral(uid, amt)
+            
+            user = get_user(uid)
+            if user and user[4]:
+                reward = amt * (get_setting('referral_reward') / 100)
+                update_balance(user[4], reward)
+            
+            await message.answer(f"✅ <b>БАЛАНС ПОПОЛНЕН НА {amt} ₽</b>")
+        else:
+            await message.answer("❌ ПЛАТЕЖ НЕ НАЙДЕН")
+            
 @dp.callback_query(F.data == "delete_invalid_sessions")
 async def delete_invalid_sessions(callback: types.CallbackQuery, state: FSMContext):
     """Подтверждение удаления невалидных сессий"""
@@ -2971,31 +3232,6 @@ async def stars_amount_handler(message: types.Message, state: FSMContext):
 @dp.pre_checkout_query()
 async def pre_checkout_handler(pre_checkout_query: PreCheckoutQuery):
     await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
-
-@dp.message(F.successful_payment)
-async def successful_payment_handler(message: types.Message):
-    payload = message.successful_payment.invoice_payload
-    
-    if payload.startswith("stars_"):
-        conn = sqlite3.connect('shop.db')
-        c = conn.cursor()
-        c.execute("SELECT id, user_id, amount FROM pending_payments WHERE invoice_id = ? AND status='pending'", (payload,))
-        payment = c.fetchone()
-        conn.close()
-        
-        if payment:
-            pid, uid, amt = payment
-            update_balance(uid, amt)
-            update_payment_status(pid, 'confirmed')
-            
-            user = get_user(uid)
-            if user and user[4]:
-                reward = amt * (get_setting('referral_reward') / 100)
-                update_balance(user[4], reward)
-            
-            await message.answer(f"✅ <b>БАЛАНС ПОПОЛНЕН НА {amt} ₽</b>")
-        else:
-            await message.answer("❌ ПЛАТЕЖ НЕ НАЙДЕН")
 
 @dp.callback_query(F.data == "pay_sbp")
 async def pay_sbp(callback: types.CallbackQuery, state: FSMContext):
