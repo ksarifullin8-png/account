@@ -263,21 +263,8 @@ def init_db():
     ]
     
     for key, value in default_settings:
-        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, value))
-    
-    # Добавляем недостающие колонки в products (если их нет)
-    try:
-        c.execute("ALTER TABLE products ADD COLUMN spam_block INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        c.execute("ALTER TABLE products ADD COLUMN register_date TEXT")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        c.execute("ALTER TABLE products ADD COLUMN account_age INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
+        # 🔥 Используем REPLACE для обновления существующих или вставки новых
+        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
     
     conn.commit()
     conn.close()
@@ -674,7 +661,17 @@ def get_setting(key: str) -> Any:
     conn.close()
     
     if result is None:
-        return None
+        # 🔥 Возвращаем значения по умолчанию для отсутствующих ключей
+        defaults = {
+            'stars_rate': STARS_RATE,
+            'usdt_rate': USDT_RATE,
+            'referral_discount': 10,
+            'referral_reward': 20,
+            'referral_fixed_reward': 3,
+            'referral_activation_threshold': 70,
+            'reviews_channel_link': 'https://t.me/+UuMm3vm8C69mNTdi'
+        }
+        return defaults.get(key, None)
     
     # Добавляем новые ключи в список числовых
     if key in ['stars_rate', 'usdt_rate', 'referral_discount', 'referral_reward',
@@ -2601,7 +2598,7 @@ async def show_ref_link(callback: types.CallbackQuery):
     await safe_edit_message(callback.message, text, referral_keyboard())
     await callback.answer()
 
-@dp.callback_query(F.data == "ref_stats")
+@@dp.callback_query(F.data == "ref_stats")
 async def ref_stats(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     log_user_action(user_id, "ref_stats")
@@ -2609,6 +2606,12 @@ async def ref_stats(callback: types.CallbackQuery):
     stats = get_referral_stats(user_id)
     fixed_reward = stats['fixed_reward']
     threshold = get_setting('referral_activation_threshold')
+    
+    # 🔥 ФИКС: если threshold None, подставляем значение по умолчанию
+    if threshold is None:
+        threshold = 70  # Значение по умолчанию
+        # Также сохраняем в БД, чтобы больше не было проблем
+        update_setting('referral_activation_threshold', threshold)
     
     text = f"📊 <b>СТАТИСТИКА РЕФЕРАЛОВ</b>\n\n"
     text += f"👥 ПРИГЛАШЕНО: <b>{stats['total_count']}</b>\n"
