@@ -333,6 +333,22 @@ async def activate_referral(referrer_id: int, referred_id: int, referred_usernam
     conn = sqlite3.connect('shop.db')
     c = conn.cursor()
     
+    # ✅ ПРОВЕРКА И СОЗДАНИЕ ТАБЛИЦЫ ЕСЛИ ЕЁ НЕТ
+    c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='referral_activations'")
+    table_exists = c.fetchone()
+    
+    if not table_exists:
+        c.execute('''CREATE TABLE IF NOT EXISTS referral_activations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            referrer_id INTEGER,
+            referred_id INTEGER,
+            activated INTEGER DEFAULT 0,
+            activated_date TEXT,
+            UNIQUE(referrer_id, referred_id)
+        )''')
+        conn.commit()
+        logger.info("✅ Таблица referral_activations создана в activate_referral")
+    
     # Проверяем, существует ли запись
     c.execute("SELECT activated FROM referral_activations WHERE referrer_id = ? AND referred_id = ?", 
               (referrer_id, referred_id))
@@ -387,6 +403,22 @@ async def check_and_activate_referral(user_id: int, amount_spent: float = None):
     """Проверяет, нужно ли активировать реферала при покупке/пополнении"""
     conn = sqlite3.connect('shop.db')
     c = conn.cursor()
+    
+    # ✅ ПРОВЕРКА И СОЗДАНИЕ ТАБЛИЦЫ ЕСЛИ ЕЁ НЕТ
+    c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='referral_activations'")
+    table_exists = c.fetchone()
+    
+    if not table_exists:
+        c.execute('''CREATE TABLE IF NOT EXISTS referral_activations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            referrer_id INTEGER,
+            referred_id INTEGER,
+            activated INTEGER DEFAULT 0,
+            activated_date TEXT,
+            UNIQUE(referrer_id, referred_id)
+        )''')
+        conn.commit()
+        logger.info("✅ Таблица referral_activations создана в check_and_activate_referral")
     
     # Получаем реферера пользователя
     c.execute("SELECT referrer_id FROM users WHERE user_id = ?", (user_id,))
@@ -584,6 +616,23 @@ proxy_list = load_proxies()
 def get_referral_stats(user_id: int) -> Dict:
     conn = sqlite3.connect('shop.db')
     c = conn.cursor()
+    
+    # ✅ ПРОВЕРКА И СОЗДАНИЕ ТАБЛИЦЫ ЕСЛИ ЕЁ НЕТ
+    c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='referral_activations'")
+    table_exists = c.fetchone()
+    
+    if not table_exists:
+        # Создаём таблицу
+        c.execute('''CREATE TABLE IF NOT EXISTS referral_activations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            referrer_id INTEGER,
+            referred_id INTEGER,
+            activated INTEGER DEFAULT 0,
+            activated_date TEXT,
+            UNIQUE(referrer_id, referred_id)
+        )''')
+        conn.commit()
+        logger.info("✅ Таблица referral_activations создана в get_referral_stats")
     
     # Получаем всех приглашенных
     c.execute("SELECT username, registered_date FROM users WHERE referrer_id = ?", (user_id,))
