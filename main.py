@@ -2598,7 +2598,7 @@ async def show_ref_link(callback: types.CallbackQuery):
     await safe_edit_message(callback.message, text, referral_keyboard())
     await callback.answer()
 
-@@dp.callback_query(F.data == "ref_stats")
+@dp.callback_query(F.data == "ref_stats")
 async def ref_stats(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     log_user_action(user_id, "ref_stats")
